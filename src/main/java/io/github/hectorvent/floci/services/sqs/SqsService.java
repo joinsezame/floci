@@ -70,6 +70,7 @@ public class SqsService implements Resettable, ResourceProvider {
     private static final int DEDUP_WINDOW_SECONDS = 300; // 5 minutes
     private static final int DEDUP_LOCK_STRIPES = 256;
     private static final int MAX_RECEIVE_WAIT_TIME_SECONDS = 20;
+    private static final int MAX_DELAY_SECONDS = 900;
     private static final int MAX_BATCH_ENTRIES = 10;
     private static final int MAX_LIST_QUEUES_RESULTS = 1000;
     private static final String LIST_QUEUES_TOKEN_NAMESPACE = "sqs-list-queues";
@@ -742,6 +743,7 @@ public class SqsService implements Resettable, ResourceProvider {
 
         validateMaximumMessageSize(attributes);
         attributes = validateMessageRetentionPeriod(attributes);
+        validateDelaySeconds(attributes);
         attributes = compactRedrivePolicies(attributes);
 
         String accountId = regionResolver.getAccountId();
@@ -1036,6 +1038,12 @@ public class SqsService implements Resettable, ResourceProvider {
                             "Reason: Message must be shorter than " + queueMaxMessageSize + " bytes.", 400);
         }
 
+        if (delaySeconds != null && (delaySeconds < 0 || delaySeconds > MAX_DELAY_SECONDS)) {
+            throw new AwsException("InvalidParameterValue",
+                    "Value " + delaySeconds + " for parameter DelaySeconds is invalid. "
+                            + "Reason: Must be >= 0 and <= " + MAX_DELAY_SECONDS + ".", 400);
+        }
+
         int queueDelaySeconds = parseNonNegativeSecondsAttribute(queue.getAttributes().get("DelaySeconds"));
         String effectiveSenderId = senderId != null ? senderId : senderIdFor(queueUrl);
 
@@ -1294,6 +1302,24 @@ public class SqsService implements Resettable, ResourceProvider {
             }
         }
         return compacted;
+    }
+
+    private static void validateDelaySeconds(Map<String, String> attributes) {
+        String value = attributes == null ? null : attributes.get("DelaySeconds");
+        // An empty value is how a CloudFormation update resets the attribute.
+        if (value == null || value.isEmpty()) {
+            return;
+        }
+        int parsed;
+        try {
+            parsed = Integer.parseInt(value);
+        } catch (NumberFormatException ignored) {
+            parsed = -1;
+        }
+        if (parsed < 0 || MAX_DELAY_SECONDS < parsed) {
+            throw new AwsException("InvalidAttributeValue",
+                    "Invalid value for the parameter DelaySeconds.", 400);
+        }
     }
 
     private static AwsException invalidMessageRetentionPeriod() {
@@ -1715,6 +1741,7 @@ public class SqsService implements Resettable, ResourceProvider {
                         "The specified queue does not exist.", 400));
         validateMaximumMessageSize(attributes);
         attributes = validateMessageRetentionPeriod(attributes);
+        validateDelaySeconds(attributes);
         attributes = compactRedrivePolicies(attributes);
         if (attributes != null) {
             for (Map.Entry<String, String> entry : attributes.entrySet()) {

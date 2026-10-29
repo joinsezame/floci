@@ -1908,6 +1908,12 @@ public interface EmulatorConfig {
     interface RedshiftServerlessServiceConfig {
         @WithDefault("true")
         boolean enabled();
+
+        @WithDefault("true")
+        boolean scheduledActionsEnabled();
+
+        @WithDefault("60")
+        int scheduledActionSweepIntervalSeconds();
     }
 
     interface NeptuneServiceConfig {
@@ -2008,10 +2014,11 @@ public interface EmulatorConfig {
         Optional<String> imageTemplate();
 
         /**
-         * When true, Floci removes, in the {@code docker} runner mode, every EMR step driver a previous run
-         * of <em>this same</em> Floci left on the daemon (matched by the {@code io.floci.owner} label) when
-         * the EMR service starts. Turn it off when two Floci instances share a daemon with the same port
-         * and no resource namespace, so one does not remove the other's drivers.
+         * When true, Floci removes, in the {@code docker} runner mode, every EMR step driver and bootstrap
+         * container a previous run of <em>this same</em> Floci left on the daemon (matched by the
+         * {@code io.floci.owner} label), and the images bootstrap actions left for clusters that are gone or
+         * have ended, when the EMR service starts. Turn it off when two Floci instances share a daemon with
+         * the same port and no resource namespace, so one does not remove the other's drivers.
          *
          * Env var: FLOCI_SERVICES_EMR_RECONCILE_CONTAINERS_ON_STARTUP
          */

@@ -3014,7 +3014,7 @@ public class DynamoDbService {
      */
     public DynamoDbTableNames.ResolvedTableRef pointInTimeSourceArn(String sourceTableArn, String region,
                                                                  boolean sseOverride) {
-        if (!sourceTableArn.startsWith("arn:")) {
+        if (!AwsArnUtils.looksLikeArn(sourceTableArn)) {
             throw invalidParameter("ARNs must start with 'arn:': " + sourceTableArn);
         }
         AwsArnUtils.Arn arn;

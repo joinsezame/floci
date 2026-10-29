@@ -7,6 +7,7 @@ import jakarta.ws.rs.core.MultivaluedMap;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -345,8 +346,10 @@ class QueryConstraintCheckTest {
      */
     @Test
     void theVendoredIamFileLoadsAndCarriesTheOperationsTheseWavesClaim() {
-        QueryConstraintCheck iam =
-                QueryConstraintCheck.load("aws/iam-request-shapes.json", "IAM request shapes");
+        // Loaded in IAM's own form, naming the member with no value beside it, which is what
+        // IamRequestShapes passes and what DRIFT-13 settles.
+        QueryConstraintCheck iam = QueryConstraintCheck.load("aws/iam-request-shapes.json",
+                "IAM request shapes", SmithyValidationErrors.Violations.WITHOUT_VALUES);
 
         List<String> managedPolicyFamily = List.of("AttachGroupPolicy", "AttachRolePolicy",
                 "AttachUserPolicy", "DetachGroupPolicy", "DetachRolePolicy", "DetachUserPolicy",
@@ -360,16 +363,86 @@ class QueryConstraintCheckTest {
                     operation + " resolved to no required members, so its shape did not resolve");
         }
 
-        assertEquals(List.of("Value 'v1' at 'policyArn' failed to satisfy constraint: Member must"
+        assertEquals(List.of("Value at 'policyArn' failed to satisfy constraint: Member must"
                         + " have length greater than or equal to 20"),
                 iam.violations("GetPolicy", params("PolicyArn", "v1")));
 
         assertEquals(List.of(), iam.violations("GetAccountAuthorizationDetails", params()),
                 "every member of it is optional, so a request naming none of them breaks nothing");
-        assertEquals(List.of("Value 'Users' at 'filter.1.member' failed to satisfy constraint:"
+        assertEquals(List.of("Value at 'filter.1.member' failed to satisfy constraint:"
                         + " Member must satisfy enum value set:"
                         + " [User, Role, Group, LocalManagedPolicy, AWSManagedPolicy]"),
                 iam.violations("GetAccountAuthorizationDetails", params("Filter.member.1", "Users")),
                 "the one list this wave opts in resolves to its member's enum");
+    }
+
+    /**
+     * A constraint the service documents and the model declares nowhere is reported where that
+     * member's own violations would sit rather than after the members below it, and not at all
+     * where the member already breaks one it declares: a value a declared constraint refuses is
+     * not read against a documented set as well, which is how the checks these waves replace
+     * answered one.
+     */
+    @Test
+    void aDocumentedConstraintSitsInItsMembersPlaceAndYieldsToADeclaredOne() throws Exception {
+        Map<String, String> documented = Map.of("Name",
+                "Value 'a' at 'name' failed to satisfy constraint: Member must satisfy enum value"
+                        + " set: [b, c]");
+
+        assertEquals(List.of(
+                "Value 'a' at 'name' failed to satisfy constraint: Member must satisfy enum value"
+                        + " set: [b, c]",
+                "Value null at 'arn' failed to satisfy constraint: Member must not be null"),
+                check().violations("Put", params("Name", "a"), documented),
+                "Name is listed ahead of Arn, so what it is answered for is too");
+
+        assertEquals(List.of(
+                "Value 'a!' at 'name' failed to satisfy constraint: Member must satisfy regular"
+                        + " expression pattern: [\\w+=,.@-]+"),
+                check().violations("Take", params("Name", "a!"), documented),
+                "the shape refuses the value already, so the documented set is not read against it");
+
+        assertEquals(List.of(), check().violations("Take", params(), documented),
+                "an absent member sent no value, so there is nothing to read a set against");
+
+        assertEquals(List.of(
+                "Value null at 'name' failed to satisfy constraint: Member must not be null",
+                "Value null at 'arn' failed to satisfy constraint: Member must not be null"),
+                check().violations("Put", params(), documented),
+                "and a required one absent is answered for that alone");
+    }
+
+    /**
+     * The STS file this wave vendors, loaded as the handler loads it: the three operations resolve,
+     * their required members report in the model's order, and the two lists resolve to their
+     * members. {@code GetSessionToken} declares no required member, so a request naming none of
+     * them breaks nothing.
+     */
+    @Test
+    void theVendoredStsFileLoadsAndCarriesTheOperationsThisWaveClaims() {
+        QueryConstraintCheck sts =
+                QueryConstraintCheck.load("aws/sts-request-shapes.json", "STS request shapes");
+
+        assertEquals(List.of("Value null at 'accessKeyId' failed to satisfy constraint: Member must"
+                        + " not be null"),
+                sts.violations("GetAccessKeyInfo", params()));
+
+        assertEquals(List.of(
+                "Value null at 'audience' failed to satisfy constraint: Member must not be null",
+                "Value null at 'signingAlgorithm' failed to satisfy constraint: Member must not be"
+                        + " null"),
+                sts.violations("GetWebIdentityToken", params()));
+
+        assertEquals(List.of(), sts.violations("GetSessionToken", params()));
+        assertEquals(List.of("Value 'short' at 'serialNumber' failed to satisfy constraint: Member"
+                        + " must have length greater than or equal to 9"),
+                sts.violations("GetSessionToken", params("SerialNumber", "short")),
+                "a member nothing read until this wave resolves to its own shape");
+
+        assertEquals(List.of("Value null at 'tags.1.member.value' failed to satisfy constraint:"
+                        + " Member must not be null"),
+                sts.violations("GetWebIdentityToken", params("Audience.member.1", "app",
+                        "SigningAlgorithm", "RS256", "Tags.member.1.Key", "Team")),
+                "a tag is a list of structures, named under the index the request spelled");
     }
 }

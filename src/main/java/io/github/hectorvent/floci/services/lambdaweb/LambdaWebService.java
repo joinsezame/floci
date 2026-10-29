@@ -135,6 +135,7 @@ public class LambdaWebService implements Resettable {
     private static final Pattern PRINCIPAL_AWS = Pattern.compile("[\\w+=,.@\\:-]*");
     private static final Pattern PRINCIPAL_AWS_ARN = Pattern.compile("[\\w+=/:,.@-]*");
     private static final Pattern PRINCIPAL_SERVICE = Pattern.compile("[\\w+=,.@-]*");
+    private static final Pattern POLICY_ACTION = Pattern.compile("\\*|[a-zA-Z0-9.-]+:[^:]*");
 
     /** AWS assigns one shard label per cell. */
     private static final String DOMAIN_SHARD = "001";
@@ -1051,16 +1052,16 @@ public class LambdaWebService implements Resettable {
         if (fn.endpoints.containsKey(endpoint.endpointName)) {
             throw new AwsException("ConflictException", "The endpoint " + endpoint.endpointName + " already exists.", 409);
         }
-        if (fn.endpoints.size() >= MAX_ENDPOINTS_PER_FUNCTION) {
-            throw new AwsException("ServiceQuotaExceededException", "The function " + fn.functionArn
-                    + " has reached the maxEndpointsPerFunction quota of " + MAX_ENDPOINTS_PER_FUNCTION + ".", 402);
-        }
         if (initialRevision != null) {
             endpoint.revisionWeights = List.of(weight(initialRevision.revisionId, 100));
         } else if (!endpoint.revisionWeights.isEmpty()) {
             endpoint.revisionWeights = resolveWeights(fn, endpoint.endpointType, endpoint.revisionWeights);
         } else {
             endpoint.revisionWeights = latestRevision(fn).map(id -> List.of(weight(id, 100))).orElse(List.of());
+        }
+        if (fn.endpoints.size() >= MAX_ENDPOINTS_PER_FUNCTION) {
+            throw new AwsException("ServiceQuotaExceededException", "The function " + fn.functionArn
+                    + " has reached the maxEndpointsPerFunction quota of " + MAX_ENDPOINTS_PER_FUNCTION + ".", 402);
         }
         endpoint.endpointArn = fn.functionArn + "/endpoint/" + endpoint.endpointName;
         endpoint.functionArn = fn.functionArn;
@@ -1519,16 +1520,30 @@ public class LambdaWebService implements Resettable {
         if (statement.has("NotPrincipal") || statement.has("NotAction") || statement.has("NotResource")) {
             throw policySyntax();
         }
-        for (String action : policyValues(statement.get("Action"))) {
-            if (!action.startsWith("lambda:")) {
+        List<String> actions = policyValues(statement.get("Action"));
+        for (String action : actions) {
+            if (!POLICY_ACTION.matcher(action).matches()) {
                 throw policySyntax();
             }
         }
+        // AWS lets an action of any service through when the list also holds "*".
+        if (!actions.contains("*")
+                && !actions.stream().allMatch(action -> action.regionMatches(true, 0, "lambda:", 0, 7))) {
+            throw policySyntax();
+        }
+        String function = AwsArnUtils.parse(functionArn).resource();
         for (String resource : policyValues(statement.get("Resource"))) {
-            if (!resource.equals(functionArn) && !resource.startsWith(functionArn + "/")) {
+            if (!namesFunction(resource, function)) {
                 throw policySyntax();
             }
         }
+    }
+
+    /** AWS reads only the service and the resource, so any prefix, partition, region or account passes. */
+    private static boolean namesFunction(String resource, String function) {
+        String[] parts = resource.split(":", 6);
+        return parts.length == 6 && "lambda".equals(parts[2])
+                && (parts[5].equals(function) || parts[5].equals(function + "*") || parts[5].startsWith(function + "/"));
     }
 
     private static void requireNotPublic(JsonNode statement) {

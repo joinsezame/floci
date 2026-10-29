@@ -940,6 +940,20 @@ public class Ec2QueryHandler {
                 p.getFirst("Placement.HostId"), p.getFirst("Placement.Tenancy"), blockDeviceMappings,
                 "spot".equals(marketType), privateIpAddress, capacitySpecification);
 
+        // The request's EbsOptimized wins over a launch template's. Applied after the launch, on this
+        // API path only: CloudFormation, Auto Scaling and Fleet launches still read false. Passing it
+        // into Ec2Service.runInstances would cover all of them.
+        Boolean ebsOptimized = boolParam(p, "EbsOptimized");
+        if (ebsOptimized == null && launchTemplateData != null) {
+            ebsOptimized = launchTemplateData.getEbsOptimized();
+        }
+        if (ebsOptimized != null) {
+            for (Instance inst : res.getInstances()) {
+                service.modifyInstanceAttribute(region, inst.getInstanceId(), "ebsOptimized", ebsOptimized.toString());
+                inst.setEbsOptimized(ebsOptimized);
+            }
+        }
+
         if (!networkInterfaceTags.isEmpty()) {
             List<String> eniIds = new ArrayList<>();
             for (Instance inst : res.getInstances()) {
@@ -959,8 +973,10 @@ public class Ec2QueryHandler {
                 .start("instancesSet");
         Map<String, String> capacityAssociations = service.capacityReservationAssociations(region);
         Map<String, List<VolumeAttachment>> volumeAttachments = service.instanceVolumeAttachments(res.getInstances());
+        Ec2Service.ElasticAddresses elasticAddresses = service.elasticAddresses(region);
         for (Instance inst : res.getInstances()) {
-            xml.start("item").raw(instanceXml(inst, capacityAssociations, volumeAttachments)).end("item");
+            xml.start("item").raw(instanceXml(inst, capacityAssociations, volumeAttachments, elasticAddresses))
+                    .end("item");
         }
         xml.end("instancesSet")
                 .end("RunInstancesResponse");
@@ -1425,6 +1441,7 @@ public class Ec2QueryHandler {
         Map<String, String> capacityAssociations = service.capacityReservationAssociations(region);
         Map<String, List<VolumeAttachment>> volumeAttachments = service.instanceVolumeAttachments(
                 reservations.stream().flatMap(res -> res.getInstances().stream()).toList());
+        Ec2Service.ElasticAddresses elasticAddresses = service.elasticAddresses(region);
         for (Reservation res : reservations) {
             xml.start("item")
                     .elem("reservationId", res.getReservationId())
@@ -1432,7 +1449,8 @@ public class Ec2QueryHandler {
                     .start("groupSet").end("groupSet")
                     .start("instancesSet");
             for (Instance inst : res.getInstances()) {
-                xml.start("item").raw(instanceXml(inst, capacityAssociations, volumeAttachments)).end("item");
+                xml.start("item").raw(instanceXml(inst, capacityAssociations, volumeAttachments, elasticAddresses))
+                        .end("item");
             }
             xml.end("instancesSet").end("item");
         }
@@ -1699,6 +1717,8 @@ public class Ec2QueryHandler {
         String cidrBlock = p.getFirst("CidrBlock");
         boolean amazonProvidedIpv6 = "true".equalsIgnoreCase(p.getFirst("AmazonProvidedIpv6CidrBlock"));
         List<Tag> vpcTags = parseTagsForResource(p, "vpc");
+        // Answered before Ec2Service checks the CIDR block and the tenancy, an order AWS does not document.
+        checkDryRun(p);
         Vpc vpc = service.createVpc(region, cidrBlock, false, amazonProvidedIpv6, p.getFirst("InstanceTenancy"));
         applyResourceTags(vpcTags, region, vpc.getVpcId());
         XmlBuilder xml = new XmlBuilder()
@@ -1974,9 +1994,13 @@ public class Ec2QueryHandler {
                 .start("CreateFlowLogsResponse", AwsNamespaces.EC2)
                 .elem("requestId", UUID.randomUUID().toString())
                 .start("flowLogIdSet");
+        List<Tag> flowLogTags = parseTagsForResource(p, "vpc-flow-log");
         for (String resourceId : resourceIds) {
             FlowLog fl = flowLogService.createFlowLog(region, resourceId, resourceType, trafficType,
                     logDestinationType, logDestination, deliverLogsPermissionArn, logFormat, maxAgg);
+            if (!flowLogTags.isEmpty()) {
+                service.createTags(region, List.of(fl.getFlowLogId()), flowLogTags);
+            }
             xml.elem("item", fl.getFlowLogId());
         }
         xml.end("flowLogIdSet")
@@ -2009,6 +2033,7 @@ public class Ec2QueryHandler {
                     .elem("deliverLogsStatus", fl.getDeliverLogsStatus())
                     .elem("maxAggregationInterval", String.valueOf(fl.getMaxAggregationInterval()))
                     .elem("creationTime", ISO_FMT.format(fl.getCreationTime()))
+                    .raw(tagSetXml(service.resourceTags(region, fl.getFlowLogId())))
                     .end("item");
         }
         xml.end("flowLogSet").end("DescribeFlowLogsResponse");
@@ -3324,6 +3349,10 @@ public class Ec2QueryHandler {
         String azId = p.getFirst("AvailabilityZoneId");
         String ipv6CidrBlock = p.getFirst("Ipv6CidrBlock");
         List<Tag> tags = parseTagsForResource(p, "subnet", Set.of("subnet"));
+        // A dry run needs the VPC to exist and is answered before the CIDR, zone and overlap checks.
+        requireParameter(p, "VpcId");
+        service.requireVpc(region, vpcId);
+        checkDryRun(p);
         Subnet subnet = service.createSubnet(region, vpcId, cidrBlock, az, azId, ipv6CidrBlock);
         try {
             if (!tags.isEmpty()) {
@@ -3402,6 +3431,9 @@ public class Ec2QueryHandler {
         String groupName = requireParameter(p, "GroupName");
         String description = requireParameter(p, "GroupDescription");
         String vpcId = p.getFirst("VpcId");
+        // A dry run needs the (default) VPC to exist and is answered before the taken-name check.
+        service.requireSecurityGroupVpc(region, vpcId);
+        checkDryRun(p);
         SecurityGroup sg = service.createSecurityGroup(region, groupName, description, vpcId);
         applyResourceTags(resourceTags, region, sg.getGroupId());
         XmlBuilder xml = new XmlBuilder()
@@ -5150,7 +5182,8 @@ public class Ec2QueryHandler {
     // ─── XML fragment builders ────────────────────────────────────────────────
 
     private String instanceXml(Instance inst, Map<String, String> capacityAssociations,
-                               Map<String, List<VolumeAttachment>> volumeAttachments) {
+                               Map<String, List<VolumeAttachment>> volumeAttachments,
+                               Ec2Service.ElasticAddresses elasticAddresses) {
         XmlBuilder xml = new XmlBuilder()
                 .elem("instanceId", inst.getInstanceId())
                 .elem("imageId", inst.getImageId())
@@ -5220,8 +5253,17 @@ public class Ec2QueryHandler {
                         .elem("groupName", gi.getGroupName())
                         .end("item");
             }
-            xml.end("groupSet")
-                    .start("attachment")
+            xml.end("groupSet");
+            // The provider derives associate_public_ip_address from the presence of this element.
+            NetworkInterfaceAssociation association = service.instanceInterfaceAssociation(inst, eni, elasticAddresses);
+            if (association != null) {
+                xml.start("association")
+                        .elem("publicIp", association.getPublicIp())
+                        .elem("publicDnsName", inst.getPublicDnsName())
+                        .elem("ipOwnerId", association.getIpOwnerId())
+                        .end("association");
+            }
+            xml.start("attachment")
                     .elem("attachmentId", eni.getAttachmentId())
                     .elem("deviceIndex", String.valueOf(eni.getDeviceIndex()))
                     .elem("status", "attached");

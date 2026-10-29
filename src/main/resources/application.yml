@@ -583,6 +583,8 @@ floci:
       shutdown-timeout-seconds: ${FLOCI_SERVICES_REDSHIFT_DATA_SHUTDOWN_TIMEOUT_SECONDS:10}
     redshift-serverless:
       enabled: true
+      scheduled-actions-enabled: ${FLOCI_SERVICES_REDSHIFT_SERVERLESS_SCHEDULED_ACTIONS_ENABLED:true}
+      scheduled-action-sweep-interval-seconds: ${FLOCI_SERVICES_REDSHIFT_SERVERLESS_SCHEDULED_ACTION_SWEEP_INTERVAL_SECONDS:60}
     neptune:
       enabled: true
       proxy-base-port: 8182
@@ -599,11 +601,12 @@ floci:
       cluster-startup-delay-seconds: 0      # 0 = a cluster is ready as soon as it is created
       step-duration-seconds: 0              # 0 = a step completes as soon as it starts
       cluster-termination-delay-seconds: 0  # 0 = a cluster is TERMINATED as soon as it is TERMINATING
-      runner-mode: immediate                # docker = run each Spark step's spark-submit in a container
+      runner-mode: immediate                # docker = run bootstrap actions and steps in containers
       # docker-network: floci-network
       # image-template: "registry.internal/emr-serverless/spark/%s:20250425"   # %s = the release label
-      # Remove the step drivers a previous run of this deployment left on the daemon when the EMR
-      # service starts. Scoped to this deployment's own containers.
+      # Remove the step drivers a previous run of this deployment left on the daemon, and the images
+      # bootstrap actions left for clusters that are gone or have ended, when the EMR service starts.
+      # Scoped to this deployment's own containers and images.
       reconcile-containers-on-startup: true
     wafv2:
       enabled: true

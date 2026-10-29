@@ -613,7 +613,8 @@ public class SqsJsonHandler {
         if (node.isMissingNode() || node.isNull()) {
             return null;
         }
-        if (!node.isIntegralNumber()) {
+        // asInt() wraps a value outside the int range, so 4294967296 would read as 0.
+        if (!node.isIntegralNumber() || !node.canConvertToInt()) {
             throw new AwsException("InvalidParameterValue",
                     "Value for parameter " + paramName + " is invalid. Reason: Must be an integer.", 400);
         }

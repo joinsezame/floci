@@ -474,6 +474,14 @@ class LambdaWebServiceTest {
         assertEquals(notServed.replace("PerRegion", "MultiRegion"),
                 message(() -> service.updateEndpoint(REGION, "app", "mr", update)));
         assertEquals(plain, service.getEndpoint(REGION, "app", "pr").revisionWeights.get(0).revisionId);
+
+        for (int i = 5; i <= 10; i++) {
+            service.createEndpoint(REGION, "app", weighted("ep" + i, "HomeRegion", plain));
+        }
+        assertEquals(notServed, message(() -> service.createEndpoint(REGION, "app",
+                weighted("pr2", "PerRegion", connected))), "before the quota");
+        assertEquals("ServiceQuotaExceededException", error(() -> service.createEndpoint(REGION, "app",
+                weighted("home2", "HomeRegion", connected))).getErrorCode());
     }
 
     private ObjectNode weighted(String name, String endpointType, String... revisionIds) {
@@ -664,6 +672,12 @@ class LambdaWebServiceTest {
         assertEquals("ServiceQuotaExceededException", quota.getErrorCode());
         assertEquals(402, quota.getHttpStatus());
         assertEquals("The function " + ARN + " has reached the maxEndpointsPerFunction quota of 10.", quota.getMessage());
+        assertEquals("The endpoint dev already exists.", message(() -> service.createEndpoint(REGION, "app",
+                endpointConfig("dev"))));
+        ObjectNode missing = endpointConfig("ep11").put("autoDeploymentMode", "Disabled");
+        missing.putArray("revisionWeights").addObject().put("revisionId", "rev-aaaaa").put("weight", 100);
+        assertEquals("The revision rev-aaaaa does not exist.", message(() -> service.createEndpoint(REGION, "app",
+                missing)));
 
         String revisionId = service.listRevisions(REGION, "app", mapper.createObjectNode()).items().get(0).revisionId;
         assertEquals("The revision " + revisionId + " cannot be deleted because the endpoints [dev, ep10, ep2, ep3, ep4,"
@@ -915,6 +929,64 @@ class LambdaWebServiceTest {
         }
     }
 
+    @Test
+    void aPolicyResourceIsReadByItsServiceAndResourceOnly() {
+        LambdaWebService service = service();
+        String missing = "arn:aws:lambda:us-east-1:000000000000:web-function/missing";
+        String function = "web-function/missing";
+        for (String accepted : List.of("arn:aws-cn:lambda:us-east-1:000000000000:" + function,
+                "arn::lambda:us-east-1:000000000000:" + function, "xyz:aws:lambda:us-east-1:000000000000:" + function,
+                "ARN:aws:lambda:us-east-1:000000000000:" + function, "arn:aws:lambda:*:*:" + function,
+                "arn:aws:lambda:foo:000000000000:" + function, "arn:aws:lambda:us-west-2:111122223333:" + function,
+                "arn:aws:lambda:us-east-1::" + function, missing + "*", missing + "/", missing + "/endpoint/x:y",
+                missing + "//x")) {
+            assertEquals("ResourceNotFoundException", error(() -> service.putResourcePolicy(REGION, missing,
+                    policy(resourcePolicy("\"" + accepted + "\"")))).getErrorCode(), accepted);
+        }
+        for (String refused : List.of("arn:aws:lambda*:us-east-1:000000000000:" + function,
+                "arn:aws:LAMBDA:us-east-1:000000000000:" + function, "arn:aws:lambda:us-east-1:" + function,
+                "arn:aws:lambda:us-east-1:000000000000:Web-Function/missing", missing + ":1", missing + "**",
+                missing + "x", missing + "x*", missing + "*/endpoint/x", missing + "?",
+                "arn:aws:lambda:us-east-1:000000000000:web-function/miss*", "arn:aws:lambda:us-east-1:000000000000:*",
+                "*")) {
+            assertEquals("Policy has syntax errors.", message(() -> service.putResourcePolicy(REGION, missing,
+                    policy(resourcePolicy("\"" + refused + "\"")))), refused);
+        }
+        String other = "arn:aws:lambda:us-east-1:000000000000:web-function/other";
+        assertEquals("Policy has syntax errors.", message(() -> service.putResourcePolicy(REGION, missing,
+                policy(resourcePolicy("[\"" + missing + "\",\"" + other + "\"]")))));
+    }
+
+    private static String resourcePolicy(String resource) {
+        return grantPolicy("\"lambda:GetWebFunction\"", resource);
+    }
+
+    private static String grantPolicy(String action, String resource) {
+        return "{\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"000000000000\"},"
+                + "\"Action\":" + action + ",\"Resource\":" + resource + "}]}";
+    }
+
+    @Test
+    void aPolicyActionIsAStarOrALambdaActionInAnyCase() {
+        LambdaWebService service = service();
+        String missing = "arn:aws:lambda:us-east-1:000000000000:web-function/missing";
+        for (String accepted : List.of("\"*\"", "\"Lambda:GetWebFunction\"", "\"LAMBDA:GetWebFunction\"", "\"lambda:\"",
+                "\"lambda:*x\"", "\"lambda:Get?ebFunction\"", "\"lambda:a b!c\"", "[\"*\",\"s3:GetObject\"]",
+                "[\"s3:GetObject\",\"*\"]", "[\"*\",\"*\"]", "[\"*\",\"a.b:x\"]", "[\"*\",\"9:x\"]", "[\"*\",\"s3:\"]",
+                "[\"lambda:GetWebFunction\",\"Lambda:x\"]")) {
+            assertEquals("ResourceNotFoundException", error(() -> service.putResourcePolicy(REGION, missing,
+                    policy(grantPolicy(accepted, "\"" + missing + "\"")))).getErrorCode(), accepted);
+        }
+        for (String refused : List.of("\"lambda*\"", "\"*:*\"", "\"*:GetWebFunction\"", "\" lambda:GetWebFunction\"",
+                "\"lambda :GetWebFunction\"", "\"lambda\"", "\"**\"", "\"*x\"", "\"?\"", "\"lambda::x\"", "\"\"",
+                "\"s3:GetObject\"", "[\"lambda:GetWebFunction\",\"s3:GetObject\"]", "[\"lambda:*\",\"s3:GetObject\"]",
+                "[\"*\",\"garbage\"]", "[\"*\",\"\"]", "[\"*\",\"lambda::x\"]", "[\"*\",\"a_b:x\"]", "[\"*\",\"a+b:x\"]",
+                "[\"*\",\"l*:x\"]")) {
+            assertEquals("Policy has syntax errors.", message(() -> service.putResourcePolicy(REGION, missing,
+                    policy(grantPolicy(refused, "\"" + missing + "\"")))), refused);
+        }
+    }
+
     private static String principalPolicy(String effect, String principal, String functionArn) {
         return "{\"Statement\":[" + statement(effect, principal, functionArn) + "]}";
     }
@@ -1122,6 +1194,17 @@ class LambdaWebServiceTest {
         assertEquals(latestRefusal, message(() -> service.updateEndpoint(REGION, "app", "dev",
                 mapper.createObjectNode().put("autoDeploymentMode", "LatestRevision"))));
         assertEquals(latestRefusal, message(() -> service.createEndpoint(REGION, "app", endpointConfig("auto"))));
+        for (int i = 2; i <= 10; i++) {
+            ObjectNode pinned = endpointConfig("ep" + i).put("autoDeploymentMode", "Disabled");
+            pinned.set("revisionWeights", disabled.get("revisionWeights"));
+            service.createEndpoint(REGION, "app", pinned);
+        }
+        assertEquals(refusal, message(() -> service.createEndpoint(REGION, "app", weighted)), "before the quota");
+        assertEquals(latestRefusal, message(() -> service.createEndpoint(REGION, "app", endpointConfig("auto"))),
+                "before the quota");
+        for (int i = 2; i <= 10; i++) {
+            service.deleteEndpoint(REGION, "app", "ep" + i);
+        }
 
         service.deleteRevision(REGION, "app", bad.revisionId);
         assertEquals(List.of(good), List.copyOf(service.getFunction(REGION, "app").revisions.keySet()));

@@ -27,10 +27,11 @@ import java.util.regex.Pattern;
  * merged for a `ServiceSpecificCredentialId` breaking both its length and its pattern, and
  * `docs/services/iam.md` carries it.
  *
- * <p>The offending value is quoted, which is what {@link SmithyValidationErrors#lengthOutOfRange}
- * and this package's `validateRoleName` already answer. Whether current IAM quotes it at all is
- * what DRIFT-13 asks, and the point of reading the constraints here is that one capture would
- * change one helper rather than every message in the package.
+ * <p>Whether the offending value is quoted beside the member is the service's own, so the check is
+ * loaded with the form that service answers: IAM names the member and leaves the value out, STS
+ * quotes it. That is DRIFT-13's reading, taken from the captures in hand and recorded in
+ * {@code docs/services/iam.md}, and reading the constraints here is what makes it one object to
+ * change rather than every message in a package.
  *
  * <p>A member the request leaves out is absent, and only a required member is reported for one. A
  * member present and empty is a value: the protocol carries it, so it breaks its minimum length
@@ -62,11 +63,13 @@ public final class QueryConstraintCheck {
 
     private final JsonNode operations;
     private final JsonNode shapes;
+    private final SmithyValidationErrors.Violations messages;
     private final Map<String, Pattern> patterns = new HashMap<>();
 
-    private QueryConstraintCheck(JsonNode model) {
+    private QueryConstraintCheck(JsonNode model, SmithyValidationErrors.Violations messages) {
         this.operations = model.path("operations");
         this.shapes = model.path("shapes");
+        this.messages = messages;
         for (Map.Entry<String, JsonNode> shape : shapes.properties()) {
             if (shape.getValue().has("pattern")) {
                 patterns.put(shape.getKey(), Pattern.compile(shape.getValue().get("pattern").asText()));
@@ -77,14 +80,27 @@ public final class QueryConstraintCheck {
         }
     }
 
-    /** The vendored resource {@code name}; {@code description} names it in a failure. */
+    /**
+     * The vendored resource {@code name}, answering in the form most services do, with the
+     * offending value quoted; {@code description} names it in a failure.
+     */
     public static QueryConstraintCheck load(String name, String description) {
+        return load(name, description, SmithyValidationErrors.Violations.QUOTED);
+    }
+
+    /** The same, in the message form {@code messages} writes, which is the service's own. */
+    public static QueryConstraintCheck load(String name, String description,
+                                            SmithyValidationErrors.Violations messages) {
         return VendoredResources.read(name, description,
-                input -> new QueryConstraintCheck(MAPPER.readTree(input)));
+                input -> new QueryConstraintCheck(MAPPER.readTree(input), messages));
     }
 
     public static QueryConstraintCheck of(JsonNode model) {
-        return new QueryConstraintCheck(model);
+        return of(model, SmithyValidationErrors.Violations.QUOTED);
+    }
+
+    public static QueryConstraintCheck of(JsonNode model, SmithyValidationErrors.Violations messages) {
+        return new QueryConstraintCheck(model, messages);
     }
 
     private void requireReadableMembers(String operation, String inputShape) {
@@ -145,21 +161,37 @@ public final class QueryConstraintCheck {
 
     /** The violations {@code params} carries for {@code operation}, in the model's member order. */
     public List<String> violations(String operation, MultivaluedMap<String, String> params) {
+        return violations(operation, params, Map.of());
+    }
+
+    /**
+     * The same, with each violation of {@code documented} reported in its own member's place: a
+     * constraint the service documents where the model declares none, keyed by the member's name as
+     * the model spells it. It is a reading rather than a published shape, so it is reported where
+     * that member's own violations would sit, and only for a member the request carries that breaks
+     * none of the constraints the model declares. A value a declared constraint already refuses is
+     * not read against a documented set as well, which is how the hand-written checks these waves
+     * replace answered one, and a member that never arrived has no value to read against anything.
+     */
+    public List<String> violations(String operation, MultivaluedMap<String, String> params,
+                                   Map<String, String> documented) {
         JsonNode shape = shapes.path(operations.path(operation).asText());
         if (!shape.hasNonNull("members")) {
             return List.of();
         }
-        return structureViolations(shape, "", "", params);
+        return structureViolations(shape, "", "", params, documented);
     }
 
     /**
      * The violations the members of {@code structure} carry, in the order the model lists them.
      * {@code prefix} is what the request names them under and {@code path} what a message calls
      * them: both are empty at the top level, and name the member above inside a structure or inside
-     * a list's member.
+     * a list's member. {@code documented} carries the violations the service documents rather than
+     * declares, which only the operation's own members have: a nested walk is handed none.
      */
     private List<String> structureViolations(JsonNode structure, String prefix, String path,
-                                             MultivaluedMap<String, String> params) {
+                                             MultivaluedMap<String, String> params,
+                                             Map<String, String> documented) {
         Set<String> required = new LinkedHashSet<>();
         structure.path("required").forEach(name -> required.add(name.asText()));
         List<String> violations = new ArrayList<>();
@@ -170,22 +202,41 @@ public final class QueryConstraintCheck {
             String param = prefix + name;
             boolean mandatory = required.contains(name);
             JsonNode shape = shapes.path(shapeName);
-            switch (shape.path("type").asText()) {
-                case "list" -> violations.addAll(listViolations(shape, param, memberPath, mandatory, params));
-                case "structure" -> violations.addAll(nestedViolations(shape, param, memberPath, mandatory, params));
-                default -> {
-                    String value = params == null ? null : params.getFirst(param);
-                    if (value == null) {
-                        if (mandatory) {
-                            violations.add(SmithyValidationErrors.notNull(memberPath));
-                        }
-                    } else {
-                        violations.addAll(violations(shapeName, value, memberPath));
-                    }
-                }
+            List<String> own = switch (shape.path("type").asText()) {
+                case "list" -> listViolations(shape, param, memberPath, mandatory, params);
+                case "structure" -> nestedViolations(shape, param, memberPath, mandatory, params);
+                default -> scalarViolations(shapeName, param, memberPath, mandatory, params);
+            };
+            violations.addAll(own);
+            if (own.isEmpty() && documented.containsKey(name) && carries(params, param)) {
+                violations.add(documented.get(name));
             }
         }
         return violations;
+    }
+
+    /**
+     * True when the request names {@code param} itself or anything under it, whatever kind of
+     * member it is: a scalar at its own name, a list numbered under it, a structure's fields below
+     * it. An absent member is answered for being required or for nothing at all, so it is not also
+     * answered for a constraint read off a value it never sent.
+     */
+    private static boolean carries(MultivaluedMap<String, String> params, String param) {
+        return params != null && (params.containsKey(param)
+                || params.keySet().stream().anyMatch(key -> key.startsWith(param + ".")));
+    }
+
+    /**
+     * A member one parameter carries. A request naming it at all carries a value, so only one it
+     * names nowhere is absent, and a required member is what an absent one is reported for.
+     */
+    private List<String> scalarViolations(String shapeName, String param, String path,
+                                         boolean required, MultivaluedMap<String, String> params) {
+        String value = params == null ? null : params.getFirst(param);
+        if (value == null) {
+            return required ? List.of(SmithyValidationErrors.notNull(path)) : List.of();
+        }
+        return violations(shapeName, value, path);
     }
 
     /**
@@ -210,7 +261,7 @@ public final class QueryConstraintCheck {
             String memberPath = path + "." + member.index() + ".member";
             if (structure) {
                 violations.addAll(structureViolations(shapes.path(elementShape),
-                        member.prefix() + ".", memberPath + ".", params));
+                        member.prefix() + ".", memberPath + ".", params, Map.of()));
             } else {
                 String value = params.getFirst(member.prefix());
                 violations.addAll(violations(elementShape, value == null ? "" : value, memberPath));
@@ -230,7 +281,7 @@ public final class QueryConstraintCheck {
         if (!present) {
             return required ? List.of(SmithyValidationErrors.notNull(path)) : List.of();
         }
-        return structureViolations(shape, param + ".", path + ".", params);
+        return structureViolations(shape, param + ".", path + ".", params, Map.of());
     }
 
     /** The member's name as a validation message spells it, which is the request's with a lower
@@ -250,14 +301,14 @@ public final class QueryConstraintCheck {
             return List.of();
         }
         List<String> violations = new ArrayList<>();
-        String length = SmithyValidationErrors.lengthOutOfRange(path, value,
+        String length = messages.lengthOutOfRange(path, value,
                 shape.path("min").asInt(0), shape.path("max").asInt(Integer.MAX_VALUE));
         if (length != null) {
             violations.add(length);
         }
         Pattern pattern = patterns.get(shapeName);
         if (pattern != null && !pattern.matcher(value).matches()) {
-            violations.add(SmithyValidationErrors.pattern(path, value, pattern.pattern()));
+            violations.add(messages.pattern(path, value, pattern.pattern()));
         }
         violations.addAll(single(enumViolation(shape, value, path)));
         return violations;
@@ -265,6 +316,16 @@ public final class QueryConstraintCheck {
 
     private static List<String> single(String violation) {
         return violation == null ? List.of() : List.of(violation);
+    }
+
+    /**
+     * True when {@code value} is a number as the protocol writes one, of any width: the model's
+     * bounds are what hold it, so a digit string that overflows a {@code long} is a number all the
+     * same. An operation answering a value that is no number at all asks this rather than keeping a
+     * reading of its own, since the same answer decides whether a range applies.
+     */
+    public static boolean isInteger(String value) {
+        return value != null && INTEGER.matcher(value.trim()).matches();
     }
 
     /**
@@ -277,9 +338,9 @@ public final class QueryConstraintCheck {
      * written as the number reads rather than as the request spelled it, a leading zero or plus
      * gone, which is what a parsed value already answered.
      */
-    private static String numberViolation(JsonNode shape, String value, String path) {
+    private String numberViolation(JsonNode shape, String value, String path) {
         String text = value.trim();
-        if (!INTEGER.matcher(text).matches()) {
+        if (!isInteger(text)) {
             // Not a number at all, so no range of the model's is what it breaks.
             return null;
         }
@@ -287,20 +348,20 @@ public final class QueryConstraintCheck {
         long min = shape.path("min").asLong(Long.MIN_VALUE);
         long max = shape.path("max").asLong(Long.MAX_VALUE);
         if (number.compareTo(BigInteger.valueOf(min)) < 0) {
-            return SmithyValidationErrors.valueTooSmall(path, number.toString(), min);
+            return messages.valueTooSmall(path, number.toString(), min);
         }
         if (number.compareTo(BigInteger.valueOf(max)) > 0) {
-            return SmithyValidationErrors.valueTooLarge(path, number.toString(), max);
+            return messages.valueTooLarge(path, number.toString(), max);
         }
         return null;
     }
 
-    private static String enumViolation(JsonNode shape, String value, String path) {
+    private String enumViolation(JsonNode shape, String value, String path) {
         if (!shape.has("enum")) {
             return null;
         }
         List<String> allowed = new ArrayList<>();
         shape.path("enum").forEach(choice -> allowed.add(choice.asText()));
-        return allowed.contains(value) ? null : SmithyValidationErrors.notInEnum(value, path, allowed);
+        return allowed.contains(value) ? null : messages.notInEnum(value, path, allowed);
     }
 }

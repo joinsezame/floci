@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.redshiftserverless;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.Pagination;
@@ -1029,7 +1030,7 @@ public class RedshiftServerlessService implements Resettable {
         if (nameOrArn == null || nameOrArn.isBlank()) {
             throw ServerlessSupport.validation("workgroupName is required.");
         }
-        if (!nameOrArn.startsWith("arn:")) {
+        if (!AwsArnUtils.looksLikeArn(nameOrArn)) {
             return getWorkgroup(nameOrArn, region);
         }
         return workgroupByArn(nameOrArn, region).orElseThrow(() -> workgroupNotFound(nameOrArn));
@@ -1166,7 +1167,7 @@ public class RedshiftServerlessService implements Resettable {
         }
     }
 
-    private static void validateSnapshotName(String snapshotName) {
+    static void validateSnapshotName(String snapshotName) {
         requireSnapshotName(snapshotName);
         if (snapshotName.length() < 3 || snapshotName.length() > 255 || !SNAPSHOT_NAME.matcher(snapshotName).matches()) {
             throw ServerlessSupport.validation("snapshotName must be 3-255 characters of lowercase letters, numbers, and hyphens.");

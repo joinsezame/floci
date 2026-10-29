@@ -16,6 +16,7 @@ public class Target {
     private String inputPath;
     private InputTransformer inputTransformer;
     private SqsParameters sqsParameters;
+    private KinesisParameters kinesisParameters;
     private BatchParameters batchParameters;
     private EcsParameters ecsParameters;
     private RedshiftDataParameters redshiftDataParameters;
@@ -52,6 +53,9 @@ public class Target {
 
     public SqsParameters getSqsParameters() { return sqsParameters; }
     public void setSqsParameters(SqsParameters sqsParameters) { this.sqsParameters = sqsParameters; }
+
+    public KinesisParameters getKinesisParameters() { return kinesisParameters; }
+    public void setKinesisParameters(KinesisParameters kinesisParameters) { this.kinesisParameters = kinesisParameters; }
 
     public BatchParameters getBatchParameters() { return batchParameters; }
     public void setBatchParameters(BatchParameters batchParameters) { this.batchParameters = batchParameters; }

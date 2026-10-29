@@ -1507,16 +1507,17 @@ public class DynamoDbService {
             LOG.tracev("Updated item in {0}: key={1} updateExpression={2} item={3}",
                     canonicalTableName, itemKey, updateExpression, item);
 
+            String eventName = existing == null ? "INSERT" : "MODIFY";
             // Captured in request scope on purpose: this event may be deferred to the batch drain,
             // and resolving the account inside the lambda would fall back to the default account,
             // which is the ambient-account bug this commit exists to remove.
             String ownerAccountId = regionResolver.getAccountId();
             Runnable streamEvent = () -> {
                 if (streamService != null) {
-                    streamService.captureEvent("MODIFY", existing, item, table, region);
+                    streamService.captureEvent(eventName, existing, item, table, region);
                 }
                 if (kinesisForwarder != null) {
-                    kinesisForwarder.forward("MODIFY", existing, item, table, region, ownerAccountId);
+                    kinesisForwarder.forward(eventName, existing, item, table, region, ownerAccountId);
                 }
             };
             if (deferredStreamEvents != null) {

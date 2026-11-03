@@ -4,8 +4,12 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.ContainerCaBundle;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.PublicKeys;
 import io.github.hectorvent.floci.core.common.SsrfProtection;
+import io.github.hectorvent.floci.services.cognito.CognitoAwsIssuer;
+import io.github.hectorvent.floci.services.cognito.CognitoService;
+import io.github.hectorvent.floci.services.cognito.model.UserPool;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -45,9 +49,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * Verifies the RS256 signature of a token presented to an HTTP API v2 JWT authorizer, the same
  * way real API Gateway does: fetch {@code {issuer}/.well-known/openid-configuration} to discover
  * {@code jwks_uri}, fetch the JWK Set from there, select the key matching the token's {@code kid},
- * and verify. Nothing here is Floci-specific — this is a generic OIDC-relying-party check against
- * whatever issuer a JWT authorizer is configured with (Cognito, Auth0, Okta, ...), not a lookup
- * against Floci's own emulated Cognito keys.
+ * and verify. Auth0, Okta, and a Cognito pool this emulator does not host stay on that path.
  *
  * <p>With TLS on, an issuer Floci serves itself (a Cognito pool's URL) presents a certificate of
  * Floci's CA, which the JVM's default trust store does not hold. The issuer is fetched trusting the
@@ -56,6 +58,15 @@ import java.util.concurrent.ConcurrentHashMap;
  *
  * <p>Per-issuer JWKS are cached (see {@link #CACHE_TTL}) so repeat requests to the same route
  * don't refetch the discovery document and key set on every call.
+ *
+ * <p>One issuer shape is resolved in-process. When {@code issuer} is the AWS Cognito URL of a user
+ * pool this emulator hosts ({@code https://cognito-idp.<region>.<dns-suffix>/<poolId>}, the value
+ * CDK's {@code HttpUserPoolAuthorizer} writes), the token is checked against that pool's own
+ * signing key and {@link #verify} returns the local issuer Floci minted into the token. The public
+ * URL does not publish this pool's key, and the local issuer is an HTTP address the default
+ * private-network policy refuses to fetch. A pool this emulator does not host is left on the HTTP
+ * path. A hosted pool whose key does not verify the token is rejected here: it is not retried
+ * against the public URL.
  *
  * <p>Fails closed: a network error, an unreachable issuer, an unsupported algorithm ({@code none}
  * included), or no matching key are all treated as verification failure, not as "unverifiable, so
@@ -73,12 +84,19 @@ public class JwtSignatureVerifier implements AutoCloseable {
     private final ObjectMapper objectMapper;
     private final CloseableHttpClient httpClient;
     private final boolean allowPrivateNetworkTargets;
+    private final CognitoService cognitoService;
     private final Map<String, CachedJwks> jwksCache = new ConcurrentHashMap<>();
 
     @Inject
-    public JwtSignatureVerifier(ObjectMapper objectMapper, EmulatorConfig config) {
+    public JwtSignatureVerifier(ObjectMapper objectMapper, EmulatorConfig config, CognitoService cognitoService) {
         this(objectMapper, SystemDefaultDnsResolver.INSTANCE,
-                config.security().allowPrivateJwtTargets(), ContainerCaBundle.sslContext(config).orElse(null));
+                config.security().allowPrivateJwtTargets(), ContainerCaBundle.sslContext(config).orElse(null),
+                cognitoService);
+    }
+
+    /** Tests that exercise the HTTP path and have no Cognito service to consult. */
+    public JwtSignatureVerifier(ObjectMapper objectMapper, EmulatorConfig config) {
+        this(objectMapper, config, null);
     }
 
     /**
@@ -102,8 +120,23 @@ public class JwtSignatureVerifier implements AutoCloseable {
             boolean allowPrivateNetworkTargets,
             SSLContext sslContext
     ) {
+        this(objectMapper, dnsResolver, allowPrivateNetworkTargets, sslContext, null);
+    }
+
+    /**
+     * As above, consulting {@code cognitoService} when the configured issuer is the AWS URL of a
+     * pool this emulator hosts. Null leaves every issuer on the HTTP path.
+     */
+    JwtSignatureVerifier(
+            ObjectMapper objectMapper,
+            DnsResolver dnsResolver,
+            boolean allowPrivateNetworkTargets,
+            SSLContext sslContext,
+            CognitoService cognitoService
+    ) {
         this.objectMapper = objectMapper;
         this.allowPrivateNetworkTargets = allowPrivateNetworkTargets;
+        this.cognitoService = cognitoService;
 
         ConnectionConfig connectionConfig = ConnectionConfig.custom()
                 .setConnectTimeout(Timeout.of(HTTP_TIMEOUT))
@@ -151,11 +184,14 @@ public class JwtSignatureVerifier implements AutoCloseable {
     /**
      * Verifies {@code token}'s signature against {@code issuer}'s published JWKS.
      *
+     * @return the issuer claim the token must carry. This is {@code issuer}, except when
+     *         {@code issuer} names a Cognito pool hosted here: the signature is checked against
+     *         that pool's key and the result is the local issuer the token was minted with.
      * @throws JwtVerificationException if the token is not RS256, the issuer's discovery/JWKS
      *                                   endpoints are unreachable or malformed, no key matches the
      *                                   token's {@code kid}, or the signature does not verify.
      */
-    public void verify(String token, String issuer) throws JwtVerificationException {
+    public String verify(String token, String issuer) throws JwtVerificationException {
         if (issuer == null || issuer.isBlank()) {
             throw new JwtVerificationException("JWT authorizer has no configured issuer");
         }
@@ -176,12 +212,55 @@ public class JwtSignatureVerifier implements AutoCloseable {
             throw new JwtVerificationException("Token header has no kid");
         }
 
+        Optional<UserPool> hosted = hostedPool(issuer);
+        if (hosted.isPresent()) {
+            verifyHostedPool(parts, kid, hosted.get(), issuer);
+            return cognitoService.getIssuer(hosted.get().getId());
+        }
+
         RSAPublicKey key = resolveKey(issuer, kid);
         if (key == null) {
             throw new JwtVerificationException(
                     "No JWKS key matches kid '" + kid + "' for issuer " + issuer);
         }
 
+        if (!signatureValid(parts[0] + "." + parts[1], parts[2], key)) {
+            throw new JwtVerificationException("Token signature is invalid");
+        }
+        return issuer;
+    }
+
+    private Optional<UserPool> hostedPool(String issuer) {
+        if (cognitoService == null) {
+            return Optional.empty();
+        }
+        Optional<String> poolId = CognitoAwsIssuer.poolId(issuer);
+        if (poolId.isEmpty()) {
+            return Optional.empty();
+        }
+        try {
+            return Optional.of(cognitoService.describeUserPool(poolId.get()));
+        } catch (AwsException expected) {
+            // Not a pool this emulator hosts. The caller fetches the issuer over HTTP.
+            return Optional.empty();
+        }
+    }
+
+    private void verifyHostedPool(String[] parts, String kid, UserPool pool, String issuer)
+            throws JwtVerificationException {
+        String keyId;
+        RSAPublicKey key;
+        try {
+            keyId = cognitoService.getSigningKeyId(pool);
+            key = cognitoService.getSigningPublicKey(pool);
+        } catch (RuntimeException e) {
+            throw new JwtVerificationException(
+                    "Could not load the signing key for issuer " + issuer, e);
+        }
+        if (keyId == null || keyId.isBlank() || key == null || !keyId.equals(kid)) {
+            throw new JwtVerificationException(
+                    "No JWKS key matches kid '" + kid + "' for issuer " + issuer);
+        }
         if (!signatureValid(parts[0] + "." + parts[1], parts[2], key)) {
             throw new JwtVerificationException("Token signature is invalid");
         }

@@ -21,6 +21,13 @@ bundle Floci gives the containers it launches (see [TLS](../configuration/tls.md
 authorizer on a Floci user pool verifies its tokens, as one on a Cognito user pool does on AWS. Its
 address is still a private one, so it also needs `FLOCI_SECURITY_ALLOW_PRIVATE_JWT_TARGETS=true`.
 
+An authorizer whose issuer is the AWS Cognito URL of a user pool hosted in this emulator
+(`https://cognito-idp.<region>.<dns-suffix>/<poolId>`, the value CDK's `HttpUserPoolAuthorizer`
+writes) does not fetch that public URL. Floci checks the token against the pool's own signing
+key and accepts the `iss` Floci minted, `<base-url>/<poolId>`. That is the issuer the pool's
+discovery document publishes. A Cognito URL for a pool this emulator does not host is still
+fetched over HTTP, under the network policy above, as is every other issuer.
+
 ## Custom API IDs
 
 API IDs are generated randomly, which means endpoint URLs change every time you recreate an API. To pin

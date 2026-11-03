@@ -1065,3 +1065,8 @@ http://localhost:4566/$POOL_ID
 ```
 
 This keeps the issuer, discovery document, JWKS URL, and token endpoint internally consistent for local JWT validation while supporting LocalStack-style confidential clients and resource-server-backed scopes.
+
+An HTTP API JWT authorizer configured with the AWS issuer
+`https://cognito-idp.<region>.<dns-suffix>/<poolId>` accepts these tokens. The `iss` claim stays
+`<base-url>/<poolId>`, matching this discovery document. The authorizer treats the AWS URL as the
+name of the local pool and verifies the signature with the pool's own key.

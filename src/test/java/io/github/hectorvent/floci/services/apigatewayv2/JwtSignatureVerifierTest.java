@@ -15,6 +15,8 @@ import io.github.hectorvent.floci.core.common.Base64Url;
 import io.github.hectorvent.floci.core.common.Pem;
 import io.github.hectorvent.floci.services.acm.CertificateGenerator;
 import io.github.hectorvent.floci.services.acm.model.KeyAlgorithm;
+import io.github.hectorvent.floci.services.cognito.CognitoService;
+import io.github.hectorvent.floci.services.cognito.model.UserPool;
 import org.apache.hc.client5.http.DnsResolver;
 import org.apache.hc.client5.http.SystemDefaultDnsResolver;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
@@ -49,6 +51,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 /**
@@ -105,7 +108,42 @@ class JwtSignatureVerifierTest {
     @Test
     void verifiesATokenSignedWithTheMatchingKey() throws Exception {
         String token = signToken("test-key-1", privateKey);
-        verifier.verify(token, issuer); // does not throw
+        assertEquals(issuer, verifier.verify(token, issuer));
+    }
+
+    @Test
+    void hostedCognitoPoolVerifiesAgainstThePoolKeyAndReturnsTheLocalIssuer() throws Exception {
+        UserPool pool = new UserPool();
+        pool.setId("us-east-1_localpool");
+        CognitoService cognito = mock(CognitoService.class);
+        when(cognito.describeUserPool("us-east-1_localpool")).thenReturn(pool);
+        when(cognito.getSigningKeyId(pool)).thenReturn("test-key-1");
+        when(cognito.getSigningPublicKey(pool)).thenReturn(publicKey);
+        when(cognito.getIssuer("us-east-1_localpool")).thenReturn("http://sezame-floci:4566/us-east-1_localpool");
+
+        String awsIssuer = "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_localpool";
+        try (JwtSignatureVerifier hosted = new JwtSignatureVerifier(
+                objectMapper, SystemDefaultDnsResolver.INSTANCE, false, null, cognito)) {
+            assertEquals("http://sezame-floci:4566/us-east-1_localpool",
+                    hosted.verify(signToken("test-key-1", privateKey), awsIssuer));
+
+            KeyPairGenerator gen = KeyPairGenerator.getInstance("RSA");
+            gen.initialize(2048);
+            RSAPrivateKey forgedKey = (RSAPrivateKey) gen.generateKeyPair().getPrivate();
+            String forgedToken = signToken("test-key-1", forgedKey);
+            assertThrows(JwtSignatureVerifier.JwtVerificationException.class,
+                    () -> hosted.verify(forgedToken, awsIssuer));
+        }
+    }
+
+    @Test
+    void nonCognitoIssuerStillUsesHttpDiscoveryWhenCognitoIsPresent() throws Exception {
+        CognitoService cognito = mock(CognitoService.class);
+        try (JwtSignatureVerifier hosted = new JwtSignatureVerifier(
+                objectMapper, SystemDefaultDnsResolver.INSTANCE, true, null, cognito)) {
+            assertEquals(issuer, hosted.verify(signToken("test-key-1", privateKey), issuer));
+        }
+        verifyNoInteractions(cognito);
     }
 
     @Test

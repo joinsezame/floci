@@ -3167,14 +3167,16 @@ public class ApiGatewayExecuteController {
         }
 
         // Signature verification happens before anything in the payload is trusted (including the
-        // exp/iss/aud checks below) - a claim from an unverified token proves nothing about who
-        // sent it. Mirrors what real API Gateway's JWT authorizer does against the issuer's real
-        // JWKS; failure here (bad signature, unreachable issuer, unsupported alg) is a 401 the same
-        // as any other rejection, not a fallback to unverified acceptance.
+        // exp/iss/aud checks below). A claim from an unverified token proves nothing about who
+        // sent it. verify returns the issuer the token must carry: the configured issuer, or, when
+        // that issuer is the AWS Cognito URL of a pool this emulator hosts, the local issuer Floci
+        // minted into the token. Failure (bad signature, unreachable issuer, unsupported alg) is a
+        // 401, the same as any other rejection, not a fallback to unverified acceptance.
         String configuredIssuer = authorizer.getJwtConfiguration() != null
                 ? authorizer.getJwtConfiguration().issuer() : null;
+        String expectedIssuer;
         try {
-            jwtSignatureVerifier.verify(token, configuredIssuer);
+            expectedIssuer = jwtSignatureVerifier.verify(token, configuredIssuer);
         } catch (JwtSignatureVerifier.JwtVerificationException e) {
             LOG.debugv("JWT signature verification failed for API {0}: {1}", apiId, e.getMessage());
             return new JwtAuthorizerResult(Response.status(401)
@@ -3196,8 +3198,7 @@ public class ApiGatewayExecuteController {
         }
 
         if (authorizer.getJwtConfiguration() != null) {
-            String issuer = authorizer.getJwtConfiguration().issuer();
-            if (issuer != null && !issuer.isBlank() && !issuer.equals(claims.iss)) {
+            if (expectedIssuer != null && !expectedIssuer.isBlank() && !expectedIssuer.equals(claims.iss)) {
                 return new JwtAuthorizerResult(Response.status(401)
                         .entity(jsonMessage("Unauthorized"))
                         .type(MediaType.APPLICATION_JSON).build(), null);

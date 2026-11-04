@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.kms;
 
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
+import io.github.hectorvent.floci.testing.TestAccounts;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.path.json.JsonPath;
 import io.restassured.response.Response;
@@ -870,37 +871,35 @@ class KmsIntegrationTest {
 
     @Test
     void listKeysPagesWithLimitAndMarker() {
+        String account = TestAccounts.randomId();
+        String authorization = "AWS4-HMAC-SHA256 Credential=" + account
+                + "/20261103/us-east-1/kms/aws4_request";
+        JsonPath initial = kmsAs(authorization, "ListKeys", "{}")
+                .then().statusCode(200)
+                .extract().jsonPath();
+        List<String> expectedKeyIds = new ArrayList<>(initial.getList("Keys.KeyId"));
         for (int i = 0; i < 2; i++) {
-            given()
-                    .header("X-Amz-Target", "TrentService.CreateKey")
-                    .contentType(KMS_CONTENT_TYPE)
-                    .body("{}")
-                    .when().post("/")
-                    .then().statusCode(200);
+            String keyId = kmsAs(authorization, "CreateKey", "{}")
+                    .then().statusCode(200)
+                    .extract().path("KeyMetadata.KeyId");
+            expectedKeyIds.add(keyId);
         }
 
-        JsonPath unpaged = given()
-                .header("X-Amz-Target", "TrentService.ListKeys")
-                .contentType(KMS_CONTENT_TYPE)
-                .body("{}")
-                .when().post("/")
+        JsonPath unpaged = kmsAs(authorization, "ListKeys", "{}")
                 .then()
                 .statusCode(200)
                 .body("Truncated", equalTo(false))
                 .body("$", not(hasKey("NextMarker")))
                 .extract().jsonPath();
         List<String> allKeyIds = unpaged.getList("Keys.KeyId");
-        assertTrue(allKeyIds.size() >= 2);
+        assertEquals(new HashSet<>(expectedKeyIds), new HashSet<>(allKeyIds));
+        assertEquals(expectedKeyIds.size(), allKeyIds.size());
 
         List<String> pagedKeyIds = new ArrayList<>();
         String marker = null;
         do {
             String body = marker == null ? "{\"Limit\":1}" : "{\"Limit\":1,\"Marker\":\"" + marker + "\"}";
-            JsonPath page = given()
-                    .header("X-Amz-Target", "TrentService.ListKeys")
-                    .contentType(KMS_CONTENT_TYPE)
-                    .body(body)
-                    .when().post("/")
+            JsonPath page = kmsAs(authorization, "ListKeys", body)
                     .then()
                     .statusCode(200)
                     .body("Keys.size()", equalTo(1))
@@ -1224,6 +1223,46 @@ class KmsIntegrationTest {
                 .body("{\"Limit\":1,\"Marker\":\"" + marker + "\"}")
                 .when().post("/")
                 .then().statusCode(200);
+    }
+
+    @Test
+    void anotherAccountsKeyOrAliasArnIsNotFound() {
+        String owner = "AWS4-HMAC-SHA256 Credential=000000000103/20260215/us-east-1/kms/aws4_request, "
+                + "SignedHeaders=host, Signature=abc";
+        String caller = "AWS4-HMAC-SHA256 Credential=000000000104/20260215/us-east-1/kms/aws4_request, "
+                + "SignedHeaders=host, Signature=abc";
+        String alias = "alias/shared-" + UUID.randomUUID();
+        String ownerKeyArn = kmsAs(owner, "CreateKey", "{}").then().statusCode(200)
+                .extract().path("KeyMetadata.Arn");
+        String callerKeyArn = kmsAs(caller, "CreateKey", "{}").then().statusCode(200)
+                .extract().path("KeyMetadata.Arn");
+        kmsAs(owner, "CreateAlias", "{\"AliasName\":\"%s\",\"TargetKeyId\":\"%s\"}".formatted(alias, ownerKeyArn))
+                .then().statusCode(200);
+        kmsAs(caller, "CreateAlias", "{\"AliasName\":\"%s\",\"TargetKeyId\":\"%s\"}".formatted(alias, callerKeyArn))
+                .then().statusCode(200);
+        String ownerAliasArn = "arn:aws:kms:us-east-1:000000000103:" + alias;
+        String callerAliasArn = "arn:aws:kms:us-east-1:000000000104:" + alias;
+
+        kmsAs(caller, "DescribeKey", "{\"KeyId\":\"%s\"}".formatted(ownerAliasArn)).then()
+                .statusCode(400)
+                .body("__type", equalTo("NotFoundException"))
+                .body("message", equalTo("Alias " + ownerAliasArn + " is not found."));
+        kmsAs(caller, "DescribeKey", "{\"KeyId\":\"%s\"}".formatted(ownerKeyArn)).then()
+                .statusCode(400)
+                .body("__type", equalTo("NotFoundException"))
+                .body("message", equalTo("Key '" + ownerKeyArn + "' does not exist"));
+        kmsAs(caller, "DescribeKey", "{\"KeyId\":\"%s\"}".formatted(callerAliasArn)).then()
+                .statusCode(200)
+                .body("KeyMetadata.Arn", equalTo(callerKeyArn));
+        kmsAs(owner, "DescribeKey", "{\"KeyId\":\"%s\"}".formatted(ownerAliasArn)).then()
+                .statusCode(200)
+                .body("KeyMetadata.Arn", equalTo(ownerKeyArn));
+
+        for (String[] created : new String[][] {{owner, ownerKeyArn}, {caller, callerKeyArn}}) {
+            kmsAs(created[0], "DeleteAlias", "{\"AliasName\":\"%s\"}".formatted(alias)).then().statusCode(200);
+            kmsAs(created[0], "ScheduleKeyDeletion", "{\"KeyId\":\"%s\",\"PendingWindowInDays\":7}"
+                    .formatted(created[1])).then().statusCode(200);
+        }
     }
 
     @ParameterizedTest
@@ -3270,6 +3309,15 @@ class KmsIntegrationTest {
 
     private static Response callKms(String operation, String body) {
         return given()
+                .header("X-Amz-Target", "TrentService." + operation)
+                .contentType(KMS_CONTENT_TYPE)
+                .body(body)
+                .when().post("/");
+    }
+
+    private static Response kmsAs(String authorization, String operation, String body) {
+        return given()
+                .header("Authorization", authorization)
                 .header("X-Amz-Target", "TrentService." + operation)
                 .contentType(KMS_CONTENT_TYPE)
                 .body(body)

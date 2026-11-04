@@ -9,7 +9,6 @@ import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsPartition;
 import io.github.hectorvent.floci.core.common.AwsPartitions;
-import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.CustomResourceLiveness;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.Pagination;
@@ -23,6 +22,7 @@ import io.github.hectorvent.floci.core.resource.SupportedResourceType;
 import io.github.hectorvent.floci.core.storage.StorageBackedMap;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
 import io.github.hectorvent.floci.services.ec2.model.Subnet;
 import io.github.hectorvent.floci.services.iam.AccessDeniedMessages.PolicyType;
 import io.github.hectorvent.floci.services.lambda.durable.DurableExecutionService;
@@ -52,6 +52,7 @@ import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.io.IOException;
+import java.math.BigDecimal;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -78,6 +79,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.function.Consumer;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 /**
  * Business logic for Lambda function management and invocation.
@@ -243,6 +245,18 @@ public class LambdaService implements ResourceProvider {
                   EmulatorConfig config,
                   RegionResolver regionResolver,
                   StorageFactory storageFactory) {
+        this(functionStore, warmPool, codeStore, zipExtractor, config, regionResolver, storageFactory, null);
+    }
+
+    /** Package-private constructor for tests that attach functions to EC2 resources. */
+    LambdaService(LambdaFunctionStore functionStore,
+                  WarmPool warmPool,
+                  CodeStore codeStore,
+                  ZipExtractor zipExtractor,
+                  EmulatorConfig config,
+                  RegionResolver regionResolver,
+                  StorageFactory storageFactory,
+                  Ec2Service ec2Service) {
         this.functionStore = functionStore;
         this.executorService = null;
         this.concurrencyLimiter = new LambdaConcurrencyLimiter();
@@ -261,7 +275,7 @@ public class LambdaService implements ResourceProvider {
         this.dynamodbStreamsPoller = null;
         this.storageFactory = storageFactory;
         this.layerService = null;
-        this.ec2Service = null;
+        this.ec2Service = ec2Service;
         this.customResourceLiveness = null;
         this.durableExecutionService = null;
         this.codeSigningConfigService = storageFactory == null
@@ -702,7 +716,7 @@ public class LambdaService implements ResourceProvider {
             AwsArnUtils.Arn arn = AwsArnUtils.parse(functionName);
             if (!region.equals(arn.region())
                     || !regionResolver.getAccountId().equals(arn.accountId())
-                    || !AwsRegions.partitionFor(region).equals(arn.partition())) {
+                    || !regionResolver.partitionForRegion(region).equals(arn.partition())) {
                 throw new AwsException("ResourceNotFoundException", "Function not found: " + functionName, 404);
             }
             return reference.name();
@@ -1039,8 +1053,10 @@ public class LambdaService implements ResourceProvider {
                 ? validatedConfigurationInteger(request.get("Timeout"), "Timeout", 1, 900) : 0;
 
         Map<String, Object> requestedVpcConfig = fn.getVpcConfig();
+        String requestedVpcId = fn.getVpcId();
         if (requestedVpcConfigUpdate != null) {
             requestedVpcConfig = new HashMap<>(requestedVpcConfigUpdate);
+            requestedVpcId = resolveVpcId(region, requestedVpcConfig);
         }
         List<LambdaFileSystemConfig> requestedFileSystemConfigs = fn.getFileSystemConfigs();
         if (request.containsKey("FileSystemConfigs")) {
@@ -1111,7 +1127,7 @@ public class LambdaService implements ResourceProvider {
         if (request.containsKey("VpcConfig")) {
             if (requestedVpcConfigUpdate != null) {
                 fn.setVpcConfig(requestedVpcConfig);
-                fn.setVpcId(resolveVpcId(region, requestedVpcConfig));
+                fn.setVpcId(requestedVpcId);
             }
         }
 
@@ -1694,6 +1710,7 @@ public class LambdaService implements ResourceProvider {
 
         Integer maximumRetryAttempts = parseMaximumRetryAttempts(request);
         Integer maximumRecordAgeInSeconds = parseMaximumRecordAgeInSeconds(request);
+        Integer parallelizationFactor = parseParallelizationFactor(request, eventSourceArn);
 
         EventSourceMapping.DestinationConfig destinationConfig = parseDestinationConfig(request);
 
@@ -1722,6 +1739,7 @@ public class LambdaService implements ResourceProvider {
         esm.setBisectBatchOnFunctionError(bisectBatchOnFunctionError);
         esm.setMaximumRetryAttempts(maximumRetryAttempts);
         esm.setMaximumRecordAgeInSeconds(maximumRecordAgeInSeconds);
+        esm.setParallelizationFactor(parallelizationFactor);
         esm.setDestinationConfig(destinationConfig);
         esm.setFilterCriteria(filterCriteria);
         esm.setStartingPosition(startingPosition.position());
@@ -1876,28 +1894,39 @@ public class LambdaService implements ResourceProvider {
     /** Operators AWS documents that the matcher does not implement, rejected with a clearer message. */
     private static final Set<String> UNIMPLEMENTED_FILTER_OPERATORS = Set.of("cidr", "wildcard");
 
-    /** Comparisons {@code matchesNumericFilter} understands. Anything else evaluates false for every record. */
+    /** Comparisons {@code PipesFilterMatcher} understands. It treats a pattern with any other as matching nothing. */
     private static final Set<String> NUMERIC_COMPARISONS = Set.of("=", ">", ">=", "<", "<=");
 
     /**
      * Validates the recursive shape of an EventBridge filter pattern: every field value must be either a
-     * non-empty match array (a leaf) or a nested object (recursed into). A scalar or empty-array value is a
+     * non-empty match array (a leaf) or a nested object (recursed into), and {@code $or} a non-empty list of
+     * patterns, each validated the same way. A scalar or empty-array value is a
      * pattern the matcher can never satisfy, so, with enforcement active, it would silently drop every
      * record; reject it at create/update instead.
      *
      * <p>Match-array elements are validated against the operator set the matcher implements. This does couple
      * the validator to {@code PipesFilterMatcher}, which is deliberate: now that the pollers enforce filters,
-     * a pattern the matcher cannot satisfy is destructive rather than inert. A bad operand silently corrupts
-     * delivery instead of erroring, and the failure direction is not even consistent. {@code
-     * {"numeric":[">","abc"]}} coerces its operand to zero and matches every positive value, {@code
-     * {"numeric":[">"]}} matches every record because the comparison loop never runs, and an unknown operator
-     * matches nothing, so every record is checkpointed past or deleted. Failing at create/update is the only
+     * a pattern the matcher cannot evaluate is destructive rather than inert. The matcher refuses an unknown
+     * operator or a bad operand such as {@code {"numeric":[">","abc"]}}, and the pollers treat a refused pattern
+     * as matching nothing, so every record is checkpointed past or deleted. Failing at create/update is the only
      * point where the caller can still act on it.
      */
     private static void validatePatternStructure(JsonNode node) {
         for (Map.Entry<String, JsonNode> entry : node.properties()) {
             JsonNode value = entry.getValue();
-            if (value.isArray()) {
+            if ("$or".equals(entry.getKey())) {
+                if (!value.isArray() || value.isEmpty()) {
+                    throw new AwsException("InvalidParameterValueException",
+                            "Filter Pattern field '$or' must be a non-empty list of patterns", 400);
+                }
+                for (JsonNode branch : value) {
+                    if (!branch.isObject()) {
+                        throw new AwsException("InvalidParameterValueException",
+                                "Filter Pattern field '$or' must be a non-empty list of patterns", 400);
+                    }
+                    validatePatternStructure(branch);
+                }
+            } else if (value.isArray()) {
                 if (value.isEmpty()) {
                     throw new AwsException("InvalidParameterValueException",
                             "Filter Pattern field '" + entry.getKey() + "' must have a non-empty match array", 400);
@@ -1915,17 +1944,17 @@ public class LambdaService implements ResourceProvider {
     }
 
     /**
-     * A match-array element is either a literal the matcher compares directly (string, number, or null for
-     * "absent") or a single-operator object. Two operators in one object is rejected because the matcher
+     * A match-array element is either a literal the matcher compares directly (string, number, boolean, or
+     * null) or a single-operator object. Two operators in one object is rejected because the matcher
      * tests them in a fixed order and silently honours only the first.
      */
     private static void validateMatchElement(String field, JsonNode element) {
-        if (element.isTextual() || element.isNumber() || element.isNull()) {
+        if (element.isTextual() || element.isNumber() || element.isBoolean() || element.isNull()) {
             return;
         }
         if (!element.isObject()) {
             throw new AwsException("InvalidParameterValueException", "Filter Pattern field '" + field
-                    + "' has an invalid match value: expected a string, number, null, or an operator object", 400);
+                    + "' has an invalid match value: expected a string, number, boolean, null, or an operator object", 400);
         }
         List<String> operators = new ArrayList<>();
         element.fieldNames().forEachRemaining(operators::add);
@@ -2088,25 +2117,12 @@ public class LambdaService implements ResourceProvider {
             }
             return null;
         }
-        if (!(mc instanceof Number)) {
-            throw new AwsException("InvalidParameterValueException",
-                    "ScalingConfig.MaximumConcurrency must be a numeric value", 400);
-        }
-        double d = ((Number) mc).doubleValue();
-        if (Double.isNaN(d) || Double.isInfinite(d) || d != Math.floor(d)) {
-            throw new AwsException("InvalidParameterValueException",
-                    "ScalingConfig.MaximumConcurrency must be an integer", 400);
-        }
-        long longValue = ((Number) mc).longValue();
-        if (longValue < 2 || longValue > 1000) {
-            throw new AwsException("InvalidParameterValueException",
-                    "ScalingConfig.MaximumConcurrency must be between 2 and 1000 (got " + longValue + ")", 400);
-        }
+        int maximumConcurrency = boundedInteger(mc, "ScalingConfig.MaximumConcurrency", 2, 1000);
         if (!isSqs) {
             throw new AwsException("InvalidParameterValueException",
                     "ScalingConfig is only supported for Amazon SQS event source mappings", 400);
         }
-        return new ScalingConfig((int) longValue);
+        return new ScalingConfig(maximumConcurrency);
     }
 
     /**
@@ -2115,69 +2131,75 @@ public class LambdaService implements ResourceProvider {
      * is absent so a create leaves it unset and an update leaves the stored value untouched.
      */
     private Integer parseMaximumBatchingWindow(Map<String, Object> request) {
-        Object raw = request.get("MaximumBatchingWindowInSeconds");
-        if (raw == null) {
-            return null;
-        }
-        if (!(raw instanceof Number)) {
-            throw new AwsException("InvalidParameterValueException",
-                    "MaximumBatchingWindowInSeconds must be a numeric value", 400);
-        }
-        double d = ((Number) raw).doubleValue();
-        if (Double.isNaN(d) || Double.isInfinite(d) || d != Math.floor(d)) {
-            throw new AwsException("InvalidParameterValueException",
-                    "MaximumBatchingWindowInSeconds must be an integer", 400);
-        }
-        long value = ((Number) raw).longValue();
-        if (value < 0 || value > 300) {
-            throw new AwsException("InvalidParameterValueException",
-                    "MaximumBatchingWindowInSeconds must be between 0 and 300 (got " + value + ")", 400);
-        }
-        return (int) value;
+        return boundedInteger(request.get("MaximumBatchingWindowInSeconds"), "MaximumBatchingWindowInSeconds", 0, 300);
     }
 
     private Integer parseMaximumRetryAttempts(Map<String, Object> request) {
-        Object raw = request.get("MaximumRetryAttempts");
-        if (raw == null) {
-            return null;
-        }
-        if (!(raw instanceof Number)) {
-            throw new AwsException("InvalidParameterValueException",
-                    "MaximumRetryAttempts must be a numeric value", 400);
-        }
-        double d = ((Number) raw).doubleValue();
-        if (Double.isNaN(d) || Double.isInfinite(d) || d != Math.floor(d)) {
-            throw new AwsException("InvalidParameterValueException",
-                    "MaximumRetryAttempts must be an integer", 400);
-        }
-        long value = ((Number) raw).longValue();
-        if (value < -1 || value > 10000) {
-            throw new AwsException("InvalidParameterValueException",
-                    "MaximumRetryAttempts must be between -1 and 10000 (got " + value + ")", 400);
-        }
-        return (int) value;
+        return boundedInteger(request.get("MaximumRetryAttempts"), "MaximumRetryAttempts", -1, 10000);
     }
 
+    /** -1 (infinite) or 60 to 604800: the one member whose range has a gap. */
     private Integer parseMaximumRecordAgeInSeconds(Map<String, Object> request) {
         Object raw = request.get("MaximumRecordAgeInSeconds");
+        String range = "-1 or between 60 and 604800";
+        Integer value = boundedInteger(raw, "MaximumRecordAgeInSeconds", -1, 604800, range);
+        if (value != null && value != -1 && value < 60) {
+            throw outOfRange("MaximumRecordAgeInSeconds", range, value);
+        }
+        return value;
+    }
+
+    /**
+     * Reads an integer member of an event source mapping request: {@code null} when absent, otherwise a
+     * whole number from {@code minimum} to {@code maximum}, or {@code InvalidParameterValueException}. The
+     * range is checked on the value as sent, before it is narrowed, so a value beyond {@code long} cannot
+     * wrap into range.
+     */
+    private static Integer boundedInteger(Object raw, String member, int minimum, int maximum) {
+        return boundedInteger(raw, member, minimum, maximum, "between " + minimum + " and " + maximum);
+    }
+
+    private static Integer boundedInteger(Object raw, String member, int minimum, int maximum, String range) {
         if (raw == null) {
             return null;
         }
-        if (!(raw instanceof Number)) {
-            throw new AwsException("InvalidParameterValueException",
-                    "MaximumRecordAgeInSeconds must be a numeric value", 400);
+        if (!(raw instanceof Number number)) {
+            throw new AwsException("InvalidParameterValueException", member + " must be a numeric value", 400);
         }
-        double d = ((Number) raw).doubleValue();
+        double d = number.doubleValue();
         if (Double.isNaN(d) || Double.isInfinite(d) || d != Math.floor(d)) {
-            throw new AwsException("InvalidParameterValueException",
-                    "MaximumRecordAgeInSeconds must be an integer", 400);
+            throw new AwsException("InvalidParameterValueException", member + " must be an integer", 400);
         }
-        long value = ((Number) raw).longValue();
-        if (value != -1 && (value < 60 || value > 604800)) {
-            throw new AwsException("InvalidParameterValueException",
-                    "MaximumRecordAgeInSeconds must be -1 or between 60 and 604800 (got " + value + ")", 400);
+        if (d < minimum || d > maximum) {
+            throw outOfRange(member, range, number);
         }
-        return (int) value;
+        return number.intValue();
+    }
+
+    private static AwsException outOfRange(String member, String range, Number value) {
+        // Printed as a whole number whatever its JSON spelling: 301.0 reads as 301.
+        String got = new BigDecimal(value.toString()).toBigInteger().toString();
+        return new AwsException("InvalidParameterValueException",
+                member + " must be " + range + " (got " + got + ")", 400);
+    }
+
+    /**
+     * Parses {@code ParallelizationFactor}: an integer in [1, 10], accepted only on Kinesis and
+     * DynamoDB Streams sources. Returns {@code null} when the field is absent.
+     */
+    private Integer parseParallelizationFactor(Map<String, Object> request, String eventSourceArn) {
+        Integer value = boundedInteger(request.get("ParallelizationFactor"), "ParallelizationFactor", 1, 10);
+        if (value != null && !isStreamSource(eventSourceArn)) {
+            throw new AwsException("InvalidParameterValueException",
+                    "ParallelizationFactor is only supported for Amazon Kinesis and Amazon DynamoDB Streams event sources",
+                    400);
+        }
+        return value;
+    }
+
+    static boolean isStreamSource(String eventSourceArn) {
+        return eventSourceArn != null
+                && (eventSourceArn.contains(":kinesis:") || eventSourceArn.contains(":dynamodb:"));
     }
 
     private void startPollingHelper(EventSourceMapping esm) {
@@ -2295,6 +2317,11 @@ public class LambdaService implements ResourceProvider {
         if (request.containsKey("MaximumRecordAgeInSeconds")) {
             Integer maximumRecordAge = parseMaximumRecordAgeInSeconds(request);
             changes.add(m -> m.setMaximumRecordAgeInSeconds(maximumRecordAge));
+        }
+        if (request.get("ParallelizationFactor") != null) {
+            // A JSON null is an absent member and leaves the stored factor unchanged.
+            Integer parallelizationFactor = parseParallelizationFactor(request, esm.getEventSourceArn());
+            changes.add(m -> m.setParallelizationFactor(parallelizationFactor));
         }
 
         if (request.containsKey("DestinationConfig")) {
@@ -2707,30 +2734,54 @@ public class LambdaService implements ResourceProvider {
         }
     }
 
-    /**
-     * The VpcConfig request shape carries no VpcId; VpcConfigResponse does. AWS derives it from
-     * the subnets the function is attached to, so resolve it once at attach time and store it.
-     * A subnet EC2 has never heard of resolves to null rather than failing the call - Floci's
-     * Lambda accepts unmanaged subnet ids, and CreateFunction must not start rejecting them.
-     */
+    /** Resolve the common VPC only after every requested subnet and security group is validated. */
     private String resolveVpcId(String region, Map<String, Object> vpcConfig) {
-        if (ec2Service == null || !hasValues(vpcConfig, "SubnetIds")) {
+        List<String> subnetIds = vpcResourceIds(vpcConfig, "SubnetIds");
+        List<String> groupIds = vpcResourceIds(vpcConfig, "SecurityGroupIds");
+        if (subnetIds.isEmpty() && groupIds.isEmpty()) {
             return null;
         }
-        for (Object subnetId : (List<?>) vpcConfig.get("SubnetIds")) {
-            if (subnetId == null) {
-                continue;
-            }
-            try {
-                List<Subnet> found = ec2Service.describeSubnets(region, List.of(subnetId.toString()), Map.of());
-                if (!found.isEmpty() && found.get(0).getVpcId() != null) {
-                    return found.get(0).getVpcId();
-                }
-            } catch (RuntimeException e) {
-                LOG.debugv(e, "Could not resolve VpcId for subnet {0} in {1}", subnetId, region);
-            }
+        if (subnetIds.isEmpty() || groupIds.isEmpty()) {
+            throw new AwsException("InvalidParameterValueException",
+                    "VpcConfig requires both subnet IDs and security group IDs", 400);
         }
-        return null;
+        if (ec2Service == null) {
+            return null;
+        }
+        List<Subnet> subnets = ec2Service.describeSubnets(region, subnetIds, Map.of());
+        List<SecurityGroup> groups = ec2Service.describeSecurityGroups(region, groupIds, List.of(), Map.of());
+        Set<String> knownVpcIds = subnets.stream().map(Subnet::getVpcId).collect(Collectors.toSet());
+        groups.stream().map(SecurityGroup::getVpcId).forEach(knownVpcIds::add);
+        if (knownVpcIds.contains(null) || knownVpcIds.size() > 1) {
+            throw new AwsException("InvalidParameterValueException",
+                    "All known subnets and security groups in VpcConfig must belong to the same VPC", 400);
+        }
+        if (!Set.copyOf(subnetIds).equals(
+                subnets.stream().map(Subnet::getSubnetId).collect(Collectors.toSet()))
+                || !Set.copyOf(groupIds).equals(
+                groups.stream().map(SecurityGroup::getGroupId).collect(Collectors.toSet()))) {
+            return null;
+        }
+        return knownVpcIds.stream().findFirst().orElse(null);
+    }
+
+    private static List<String> vpcResourceIds(Map<String, Object> vpcConfig, String member) {
+        Object value = vpcConfig == null ? null : vpcConfig.get(member);
+        if (value == null) {
+            return List.of();
+        }
+        if (!(value instanceof List<?> list)) {
+            throw new AwsException("SerializationException", "VpcConfig." + member + " must be an array", 400);
+        }
+        List<String> ids = new ArrayList<>(list.size());
+        for (Object id : list) {
+            if (!(id instanceof String resourceId)) {
+                throw new AwsException("SerializationException",
+                        "VpcConfig." + member + " must contain strings", 400);
+            }
+            ids.add(resourceId);
+        }
+        return ids;
     }
 
     private static Map<String, Object> structureMember(Map<String, Object> request, String member) {
@@ -3882,7 +3933,7 @@ public class LambdaService implements ResourceProvider {
      * (such as {@code *}) is kept as given. ARNs are checked first because an IAM role, user or
      * session name may contain a dot.
      */
-    private static Object permissionPrincipal(String principal, String region) {
+    private Object permissionPrincipal(String principal, String region) {
         if (principal == null) {
             return null;
         }
@@ -3890,7 +3941,7 @@ public class LambdaService implements ResourceProvider {
             return Map.of("AWS", principal);
         }
         if (ACCOUNT_ID_PATTERN.matcher(principal).matches()) {
-            String partition = AwsRegions.partitionFor(region);
+            String partition = regionResolver.partitionForRegion(region);
             return Map.of("AWS", AwsArnUtils.Arn.global(partition, "iam", principal, "root").toString());
         }
         if (principal.contains(".")) {

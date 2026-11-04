@@ -255,6 +255,7 @@ class EmrServerlessJobRunServiceTest {
         assertEquals(REGION, job.region());
         assertEquals("emr-7.5.0", job.releaseLabel());
         assertNull(job.imageTemplate());
+        assertNull(job.customImage());
         assertNull(job.dockerNetwork());
         assertEquals(ROLE, job.executionRole());
         assertEquals(List.of("s3://bucket/jobs/app.jar"), job.application());
@@ -262,6 +263,69 @@ class EmrServerlessJobRunServiceTest {
         assertEquals(Duration.ZERO, runner.jobs.get(1).timeout());
         assertNull(job.logFolder());
         assertNull(job.cloudWatchLogs());
+        assertEquals(Map.of(), job.environment());
+        assertEquals(List.of(), job.archives());
+        // An EMR Serverless application has no cluster, nor its storage.
+        assertNull(job.storage());
+    }
+
+    @Test
+    void theRunnerGetsTheDriverWorkerTypesCustomImageElseTheApplicationsElseTheReleases() {
+        FakeRunner runner = new FakeRunner();
+        EmrServerlessJobRunService service = dockerService(runner);
+        String applicationImage = "123456789012.dkr.ecr.us-east-1.amazonaws.com/spark/custom:7.5.0";
+        String driverImage = "123456789012.dkr.ecr.us-east-1.amazonaws.com/spark/driver:7.5.0";
+        CreateApplicationRequest wholeApplication = applicationRequest("custom", "emr-7.5.0", "SPARK");
+        wholeApplication.setImageConfiguration(EmrServerlessServiceTest.image(applicationImage));
+        // Local mode runs the executors in the driver's container, so an Executor image is not used.
+        wholeApplication.setWorkerTypeSpecifications(
+                Map.of("Executor", EmrServerlessServiceTest.workerType(driverImage)));
+        CreateApplicationRequest perWorkerType = applicationRequest("per-worker-type", "emr-7.5.0", "SPARK");
+        perWorkerType.setImageConfiguration(EmrServerlessServiceTest.image(applicationImage));
+        perWorkerType.setWorkerTypeSpecifications(Map.of("Driver", EmrServerlessServiceTest.workerType(driverImage)));
+
+        service.startJobRun(applications.createApplication(wholeApplication).getApplicationId(), request(null, null));
+        service.startJobRun(applications.createApplication(perWorkerType).getApplicationId(), request(null, null));
+        service.startJobRun(applicationId, request(null, null));
+        for (int i = 0; i < 3; i++) {
+            runNext();
+        }
+
+        assertEquals(applicationImage, runner.jobs.get(0).customImage());
+        assertEquals(driverImage, runner.jobs.get(1).customImage());
+        assertNull(runner.jobs.get(2).customImage());
+    }
+
+    @Test
+    void aHiveRunGetsTheHiveDriverWorkerTypesCustomImageElseTheApplicationsElseTheReleases() {
+        FakeRunner runner = new FakeRunner();
+        EmrServerlessJobRunService service = dockerService(runner);
+        String applicationImage = "123456789012.dkr.ecr.us-east-1.amazonaws.com/hive/custom:7.5.0";
+        String driverImage = "123456789012.dkr.ecr.us-east-1.amazonaws.com/hive/driver:7.5.0";
+        CreateApplicationRequest wholeApplication = applicationRequest("custom", "emr-7.5.0", "HIVE");
+        wholeApplication.setImageConfiguration(EmrServerlessServiceTest.image(applicationImage));
+        // Tez in local mode runs its tasks in the driver's container, so a TezTask image is not used.
+        wholeApplication.setWorkerTypeSpecifications(
+                Map.of("TezTask", EmrServerlessServiceTest.workerType(driverImage)));
+        CreateApplicationRequest perWorkerType = applicationRequest("per-worker-type", "emr-7.5.0", "HIVE");
+        perWorkerType.setImageConfiguration(EmrServerlessServiceTest.image(applicationImage));
+        perWorkerType.setWorkerTypeSpecifications(
+                Map.of("HiveDriver", EmrServerlessServiceTest.workerType(driverImage)));
+        String release = applications.createApplication(applicationRequest("hive", "emr-7.5.0", "HIVE"))
+                .getApplicationId();
+
+        for (CreateApplicationRequest create : List.of(wholeApplication, perWorkerType)) {
+            service.startJobRun(applications.createApplication(create).getApplicationId(),
+                    hiveRequest("s3://bucket/queries/report.sql", null, null));
+        }
+        service.startJobRun(release, hiveRequest("s3://bucket/queries/report.sql", null, null));
+        for (int i = 0; i < 3; i++) {
+            runNext();
+        }
+
+        assertEquals(applicationImage, runner.jobs.get(0).customImage());
+        assertEquals(driverImage, runner.jobs.get(1).customImage());
+        assertNull(runner.jobs.get(2).customImage());
     }
 
     @Test
@@ -585,6 +649,25 @@ class EmrServerlessJobRunServiceTest {
         return create;
     }
 
+    // A run of query, after initQueryFile, with parameters, either of the two null for none.
+    private static StartJobRunRequest hiveRequest(String query, String initQueryFile, String parameters) {
+        JobDriver.Hive hive = new JobDriver.Hive();
+        hive.setQuery(query);
+        hive.setInitQueryFile(initQueryFile);
+        hive.setParameters(parameters);
+        StartJobRunRequest request = request(null, null);
+        request.getJobDriver().setSparkSubmit(null);
+        request.getJobDriver().setHive(hive);
+        return request;
+    }
+
+    private static RuntimeConfiguration configuration(String classification, Map<String, String> properties) {
+        RuntimeConfiguration configuration = new RuntimeConfiguration();
+        configuration.setMember("classification", classification);
+        configuration.setMember("properties", properties);
+        return configuration;
+    }
+
     private static MonitoringConfiguration s3LogUri(String logUri) {
         MonitoringConfiguration monitoring = new MonitoringConfiguration();
         monitoring.setProperty("s3MonitoringConfiguration", Map.of("logUri", logUri));
@@ -635,6 +718,71 @@ class EmrServerlessJobRunServiceTest {
         assertEquals(List.of("--conf", "spark.executor.cores=2", "--py-files", "s3://bucket/jobs/lib.zip",
                 "s3://bucket/jobs/report.py", "s3://bucket/input/", "s3://bucket/output/"),
                 EmrServerlessJobRunService.application(sparkSubmit));
+    }
+
+    @Test
+    void aRunsDriverEnvAndArchivesAreItsSparkPropertiesTheSubmitParametersWinning() {
+        FakeRunner runner = new FakeRunner();
+        EmrServerlessJobRunService service = dockerService(runner);
+        RuntimeConfiguration defaults = new RuntimeConfiguration();
+        defaults.setMember("classification", "spark-defaults");
+        defaults.setMember("properties", Map.of(
+                "spark.emr-serverless.driverEnv.JAVA_HOME", "/usr/lib/jvm/java-17-amazon-corretto.x86_64/",
+                "spark.archives", "s3://bucket/envs/previous.tar.gz#environment"));
+        CreateApplicationRequest create = applicationRequest("python", "emr-7.5.0", "SPARK");
+        create.setRuntimeConfiguration(List.of(defaults));
+        String python = applications.createApplication(create).getApplicationId();
+        // The user guide's "Building a Python virtual environment".
+        StartJobRunRequest request = request(null, null);
+        request.getJobDriver().getSparkSubmit().setSparkSubmitParameters(String.join(" ",
+                "--conf spark.archives=s3://bucket/envs/pyspark_venv.tar.gz#environment",
+                "--conf spark.emr-serverless.driverEnv.PYSPARK_DRIVER_PYTHON=./environment/bin/python",
+                "--conf spark.emr-serverless.driverEnv.PYSPARK_PYTHON=./environment/bin/python",
+                "--conf spark.executorEnv.PYSPARK_PYTHON=./environment/bin/python"));
+
+        service.startJobRun(python, request);
+        runNext();
+
+        SparkJobRunner.Job job = runner.jobs.get(0);
+        assertEquals(Map.of("JAVA_HOME", "/usr/lib/jvm/java-17-amazon-corretto.x86_64/",
+                "PYSPARK_DRIVER_PYTHON", "./environment/bin/python", "PYSPARK_PYTHON", "./environment/bin/python"),
+                job.environment());
+        assertEquals(List.of("s3://bucket/envs/pyspark_venv.tar.gz#environment"), job.archives());
+    }
+
+    @Test
+    void sparkPropertiesTakeEachFormOfConfASubmitGivesALaterOneWinning() {
+        JobDriver.SparkSubmit sparkSubmit = new JobDriver.SparkSubmit();
+        sparkSubmit.setSparkSubmitParameters("--conf spark.archives=s3://bucket/a.zip "
+                + "--conf='spark.archives= s3://bucket/b.tar.gz#b ,, s3://bucket/c.tgz' "
+                + "-c spark.emr-serverless.driverEnv.A=1=2 --conf spark.emr-serverless.driverEnv.=x "
+                + "--conf no-value --name spark.archives=ignored --conf");
+
+        Map<String, String> properties = EmrServerlessJobRunService.sparkProperties(
+                Map.of("spark.executor.cores", "4"), sparkSubmit);
+
+        assertEquals(Map.of("spark.executor.cores", "4",
+                "spark.archives", " s3://bucket/b.tar.gz#b ,, s3://bucket/c.tgz",
+                "spark.emr-serverless.driverEnv.A", "1=2", "spark.emr-serverless.driverEnv.", "x"), properties);
+        assertEquals(List.of("s3://bucket/b.tar.gz#b", "s3://bucket/c.tgz"),
+                EmrServerlessJobRunService.archives(properties));
+        assertEquals(Map.of("A", "1=2"), EmrServerlessJobRunService.driverEnvironment(properties));
+    }
+
+    @Test
+    void theLastArchivesOptionIsSparkArchivesWinningOverASettingOfItWhereverThatComes() {
+        JobDriver.SparkSubmit sparkSubmit = new JobDriver.SparkSubmit();
+        sparkSubmit.setSparkSubmitParameters("--archives s3://bucket/first.zip "
+                + "--archives=s3://bucket/envs/pyspark_venv.tar.gz#environment "
+                + "--conf spark.archives=s3://bucket/conf.zip");
+
+        Map<String, String> properties = EmrServerlessJobRunService.sparkProperties(
+                Map.of("spark.archives", "s3://bucket/defaults.zip"), sparkSubmit);
+
+        assertEquals(Map.of("spark.archives", "s3://bucket/envs/pyspark_venv.tar.gz#environment"), properties);
+        sparkSubmit.setSparkSubmitParameters("--conf spark.archives=s3://bucket/conf.zip --archives");
+        assertEquals(Map.of("spark.archives", "s3://bucket/conf.zip"),
+                EmrServerlessJobRunService.sparkProperties(Map.of(), sparkSubmit));
     }
 
     private String applicationWithSparkDefaults(String releaseLabel) {
@@ -721,20 +869,113 @@ class EmrServerlessJobRunServiceTest {
     }
 
     @Test
-    void aHiveRunFailsWithoutRunning() {
+    void aHiveRunGoesToTheRunnerWithItsSettingsQueryFilesAndParametersInTheGuidesOrder() {
+        FakeRunner runner = new FakeRunner();
+        EmrServerlessJobRunService service = dockerService(runner);
+        CreateApplicationRequest create = applicationRequest("hive", "emr-7.5.0", "HIVE");
+        create.setRuntimeConfiguration(List.of(
+                configuration("core-site", Map.of("fs.s3a.connection.maximum", "50")),
+                configuration("hive-site", Map.of("hive.exec.scratchdir", "s3://bucket/app-scratch/"))));
+        create.setMonitoringConfiguration(s3LogUri("s3://logs/hive"));
+        String hive = applications.createApplication(create).getApplicationId();
+        StartJobRunRequest request = hiveRequest("s3://bucket/queries/report.sql", "s3://bucket/queries/init.sql",
+                "--hiveconf hive.exec.reducers.max=4 --hivevar day=2026-11-03");
+        // The run's hive-site replaces the application's, and its tez-site adds Tez's file.
+        request.setConfigurationOverrides(Map.of("applicationConfiguration", List.of(
+                Map.of("classification", "hive-site", "properties",
+                        Map.of("hive.exec.scratchdir", "s3://bucket/scratch/")),
+                Map.of("classification", "tez-site", "properties", Map.of("tez.grouping.max-size", "268435456")))));
+
+        String jobRunId = service.startJobRun(hive, request).getJobRunId();
+        runNext();
+
+        SparkJobRunner.Job job = runner.jobs.get(0);
+        assertEquals(SparkJobRunner.Engine.HIVE, job.engine());
+        assertNull(job.imageTemplate());
+        assertEquals(List.of(
+                "--hiveconf", "fs.s3a.connection.maximum=50",
+                "--hiveconf", "tez.grouping.max-size=268435456",
+                "--hiveconf", "hive.exec.scratchdir=s3://bucket/scratch/",
+                "-i", "s3://bucket/queries/init.sql", "-f", "s3://bucket/queries/report.sql",
+                "--hiveconf", "hive.exec.reducers.max=4", "--hivevar", "day=2026-11-03"), job.application());
+        assertEquals(Map.of(), job.sparkDefaults());
+        assertEquals(List.of(), job.archives());
+        assertEquals("s3://logs/hive/applications/" + hive + "/jobs/" + jobRunId + "/HIVE_DRIVER/", job.logFolder());
+        assertEquals("SUCCESS", service.getJobRun(hive, jobRunId, null).getState());
+    }
+
+    @Test
+    void aSparkRunGetsTheImageTemplateAndAHiveRunTheHiveImageTemplate() {
+        FakeRunner runner = new FakeRunner();
+        EmrServerlessJobRunService service = new EmrServerlessJobRunService(store, applications, iamService,
+                new RegionResolver(REGION, ACCOUNT_ID), null, objectMapper, 0, clock, runner, tasks::add,
+                "registry.internal/emr-serverless/spark/%s:20250425",
+                "registry.internal/emr-serverless/hive/%s:20250425", "floci-network");
         String hive = applications.createApplication(applicationRequest("hive", "emr-7.5.0", "HIVE"))
                 .getApplicationId();
-        JobDriver.Hive query = new JobDriver.Hive();
-        query.setQuery("s3://bucket/queries/report.sql");
-        StartJobRunRequest request = request(null, null);
-        request.getJobDriver().setSparkSubmit(null);
-        request.getJobDriver().setHive(query);
 
-        JobRun run = dockerService(new FakeRunner()).startJobRun(hive, request);
+        service.startJobRun(applicationId, request(null, null));
+        service.startJobRun(hive, hiveRequest("s3://bucket/queries/report.sql", null, null));
+        runNext();
+        runNext();
 
-        assertEquals("FAILED", run.getState());
-        assertEquals(EmrServerlessJobRunService.HIVE_NOT_RUN, run.getStateDetails());
+        assertEquals("registry.internal/emr-serverless/spark/%s:20250425", runner.jobs.get(0).imageTemplate());
+        assertEquals("registry.internal/emr-serverless/hive/%s:20250425", runner.jobs.get(1).imageTemplate());
+        assertEquals("floci-network", runner.jobs.get(1).dockerNetwork());
+    }
+
+    @Test
+    void aHiveRunWithoutAnInitQueryFileOrParametersRunsItsQuery() {
+        FakeRunner runner = new FakeRunner();
+        EmrServerlessJobRunService service = dockerService(runner);
+        String hive = applications.createApplication(applicationRequest("hive", "emr-7.5.0", "HIVE"))
+                .getApplicationId();
+
+        service.startJobRun(hive, hiveRequest("s3://bucket/queries/report.sql", null, null));
+        runNext();
+
+        assertEquals(List.of("-f", "s3://bucket/queries/report.sql"), runner.jobs.get(0).application());
+    }
+
+    @Test
+    void aRunWhoseDriverIsNotItsApplicationsTypeFailsWithoutRunning() {
+        FakeRunner runner = new FakeRunner();
+        EmrServerlessJobRunService service = dockerService(runner);
+        String hive = applications.createApplication(applicationRequest("hive", "emr-7.5.0", "HIVE"))
+                .getApplicationId();
+
+        JobRun sparkOnHive = service.startJobRun(hive, request(null, null));
+        JobRun hiveOnSpark = service.startJobRun(applicationId,
+                hiveRequest("s3://bucket/queries/report.sql", null, null));
+
+        for (JobRun run : List.of(sparkOnHive, hiveOnSpark)) {
+            assertEquals("FAILED", run.getState());
+            assertEquals(EmrServerlessJobRunService.DRIVER_NOT_THE_APPLICATIONS, run.getStateDetails());
+        }
         assertEquals(List.of(), tasks);
+        assertEquals(List.of(), runner.jobs);
+    }
+
+    @Test
+    void aHiveRunsDriverLogsToCloudWatchUnderItsHiveDriverAsLogTypesNamesIt() {
+        Application app = new Application();
+        app.setMonitoringConfiguration(cloudWatchLogging(Map.of("enabled", true)));
+        JobRun run = run("emr-7.5.0", "BATCH", null);
+        JobDriver driver = new JobDriver();
+        driver.setHive(new JobDriver.Hive());
+        run.setJobDriver(driver);
+
+        assertEquals(new SparkJobRunner.CloudWatchLogs("/aws/emr-serverless",
+                "/applications/app/jobs/run/HIVE_DRIVER/stdout", "/applications/app/jobs/run/HIVE_DRIVER/stderr"),
+                EmrServerlessJobRunService.driverCloudWatchLogs(app, run));
+
+        // "HIVE_DRIVER : ["STDERR", "STDOUT", "HIVE_LOG", "TEZ_AM"]": its driver's, not SPARK_DRIVER's.
+        app.setMonitoringConfiguration(cloudWatchLogging(Map.of("enabled", true,
+                "logTypes", Map.of("HIVE_DRIVER", List.of("STDERR"), "SPARK_DRIVER", List.of("STDOUT")))));
+
+        assertEquals(new SparkJobRunner.CloudWatchLogs("/aws/emr-serverless", null,
+                "/applications/app/jobs/run/HIVE_DRIVER/stderr"),
+                EmrServerlessJobRunService.driverCloudWatchLogs(app, run));
     }
 
     @Test

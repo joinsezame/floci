@@ -175,6 +175,17 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
 
     public EventBus createEventBus(String name, String description,
                                    Map<String, String> tags, String region) {
+        return createEventBus(name, description, null, null, null, tags, region);
+    }
+
+    /**
+     * Creates a custom bus with the KMS key, dead-letter queue and log configuration the request
+     * gives, as {@code CreateEventBus} takes them; a null member leaves the bus without it. The
+     * dead-letter and log configurations are stored as their JSON, as {@link #updateEventBus} does.
+     */
+    public EventBus createEventBus(String name, String description, String kmsKeyIdentifier,
+                                   String deadLetterConfig, String logConfig,
+                                   Map<String, String> tags, String region) {
         validateCustomEventBusName(name);
         validateEventBusDescription(description);
         String key = busKey(region, name);
@@ -188,6 +199,15 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
                 description,
                 Instant.now()
         );
+        if (kmsKeyIdentifier != null && !kmsKeyIdentifier.isBlank()) {
+            bus.setKmsKeyIdentifier(kmsKeyIdentifier);
+        }
+        if (deadLetterConfig != null && !deadLetterConfig.isBlank()) {
+            bus.setDeadLetterConfig(deadLetterConfig);
+        }
+        if (logConfig != null && !logConfig.isBlank()) {
+            bus.setLogConfig(logConfig);
+        }
         if (tags != null) {
             bus.getTags().putAll(tags);
             resourceGroupsTaggingService.tagResources(List.of(bus.getArn()), tags, region);
@@ -1506,7 +1526,8 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
                     "Parameter EventSourceArn is not valid. Reason: Creating cross-region archive is not permitted.",
                     400);
         }
-        String busName = eventSourceArn.substring(eventSourceArn.indexOf('/') + 1);
+        String busName = source != null && source.resource().startsWith("event-bus/")
+                ? source.resource().substring("event-bus/".length()) : eventSourceArn;
         EventBus bus = "default".equals(busName)
                 ? getOrCreateDefaultBus(region)
                 : busStore.get(busKey(region, busName)).orElse(null);
@@ -1624,11 +1645,15 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
     }
 
     /**
-     * The ARN of the caller's connection or API destination of the name in the Region, which follows the name with
-     * the id it was minted with, as its handlers look it up.
+     * The ARN of the caller's connection or API destination of the one name in the Region, which follows the name
+     * with the id it was minted with, as its handlers look it up.
      */
     @Override
-    public Optional<String> find(String type, String name, String region) {
+    public Optional<String> find(String type, List<String> names, String region) {
+        if (names.size() != 1) {
+            return Optional.empty();
+        }
+        String name = names.getFirst();
         return switch (type) {
             case "connection" -> connectionStore.get(connectionKey(region, name)).map(Connection::getConnectionArn);
             case "api-destination" -> apiDestinationStore.get(apiDestinationKey(region, name)).map(ApiDestination::getArn);
@@ -2167,9 +2192,13 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
     }
 
     private static String archiveNameFromArn(String arn) {
-        if (arn == null) return null;
-        int idx = arn.lastIndexOf("archive/");
-        return idx >= 0 ? arn.substring(idx + "archive/".length()) : arn;
+        if (arn == null) {
+            return null;
+        }
+        return AwsArnUtils.resourceIfArnFor(arn, "events")
+                .filter(resource -> resource.startsWith("archive/"))
+                .map(resource -> resource.substring("archive/".length()))
+                .orElse(arn);
     }
 
     private void startSchedulerIfNeeded(Rule rule) {

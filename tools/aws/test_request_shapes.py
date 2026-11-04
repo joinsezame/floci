@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -22,6 +23,8 @@ import regen_ecr_shapes
 import regen_ecs_shapes
 import regen_emr_serverless_shapes
 import regen_iam_shapes
+import regen_payment_cryptography_shapes
+import regen_logs_delivery_shapes
 import regen_resource_groups_shapes
 import regen_sesv2_shapes
 import regen_sts_shapes
@@ -293,7 +296,7 @@ def test_constraints_check_reports_a_changed_constraint(tmp_path, monkeypatch):
 
 def test_main_builds_from_the_prepared_model_and_checks_against_it(tmp_path, monkeypatch):
     # The one thing a generator may do to the model before the build, which IAM hands the driver to
-    # vendor a paged request for its paging members alone. Dropping the callback, or running it
+    # vendor a request without the members it answers for itself. Dropping the callback, or running it
     # after the build, would vendor the model as loaded, so the file is read both ways here: it
     # carries what `prepare` left, and the staleness check calls that file up to date only when it
     # prepares the model the same way.
@@ -324,10 +327,11 @@ def test_build_constraints_output_is_stable():
 
 
 @pytest.mark.parametrize("script, model, output, extra", [
-    # IAM vendors some operations for their paging members alone, so it hands the driver the
-    # reduction as well as the list.
+    # IAM vendors some operations in part, so it hands the driver its reductions as well as the
+    # list: the required members an operation answers for itself and the members it answers in a
+    # wording of its own.
     (regen_iam_shapes, "iam/2010-05-08", "iam-request-shapes.json",
-     {"prepare": regen_iam_shapes.paging_only}),
+     {"prepare": regen_iam_shapes.prepare}),
     (regen_sts_shapes, "sts/2011-06-15", "sts-request-shapes.json", {}),
 ])
 def test_each_constraints_script_runs_the_shared_main_with_its_operations(script, model, output, extra,
@@ -352,7 +356,8 @@ def vendored(script) -> tuple[str, ...]:
 
 
 @pytest.mark.parametrize("script", [
-    regen_ecr_shapes, regen_iam_shapes, regen_resource_groups_shapes, regen_sts_shapes,
+    regen_ecr_shapes, regen_iam_shapes, regen_logs_delivery_shapes, regen_payment_cryptography_shapes,
+    regen_resource_groups_shapes, regen_sts_shapes,
 ])
 def test_each_vendored_constraints_file_carries_its_operations_and_resolves_its_shapes(script):
     doc = json.loads(script.OUTPUT.read_text(encoding="utf-8"))
@@ -371,3 +376,67 @@ def test_ecr_shapes_name_the_ecr_model_and_its_registry_setting_actions():
     assert regen_ecr_shapes.MODEL == Path("ecr/2015-09-21")
     assert regen_ecr_shapes.OUTPUT.name == "ecr-request-shapes.json"
     assert "PutReplicationConfiguration" in regen_ecr_shapes.OPERATIONS
+
+
+def test_payment_cryptography_shapes_name_its_model_and_its_control_plane_actions():
+    assert regen_payment_cryptography_shapes.MODEL == Path("payment-cryptography/2021-09-14")
+    assert regen_payment_cryptography_shapes.OUTPUT.name == "payment-cryptography-request-shapes.json"
+    assert "TagResource" in regen_payment_cryptography_shapes.OPERATIONS
+    assert "UpdateAlias" in regen_payment_cryptography_shapes.OPERATIONS
+
+
+def test_payment_cryptography_shapes_widen_the_partition_the_model_writes():
+    doc = json.loads(regen_payment_cryptography_shapes.OUTPUT.read_text(encoding="utf-8"))
+
+    # The model writes the commercial partition; the service writes every partition it serves.
+    assert regen_payment_cryptography_shapes.COMMERCIAL not in doc["shapes"]["KeyArn"]["pattern"]
+    assert regen_payment_cryptography_shapes.EVERY_PARTITION in doc["shapes"]["KeyArn"]["pattern"]
+    assert regen_payment_cryptography_shapes.EVERY_PARTITION in doc["shapes"]["ResourceArn"]["pattern"]
+
+
+def test_payment_cryptography_shapes_widen_the_region_on_every_pattern_the_model_writes_it():
+    doc = json.loads(regen_payment_cryptography_shapes.OUTPUT.read_text(encoding="utf-8"))
+
+    patterns = [shape["pattern"] for shape in doc["shapes"].values() if "pattern" in shape]
+    assert not [p for p in patterns if regen_payment_cryptography_shapes.COMMERCIAL_REGION in p]
+    assert doc["shapes"]["Region"]["pattern"] == regen_payment_cryptography_shapes.EVERY_REGION
+    for name in ("KeyArn", "KeyArnOrKeyAliasType", "ResourceArn"):
+        assert regen_payment_cryptography_shapes.EVERY_REGION in doc["shapes"][name]["pattern"]
+
+
+def test_payment_cryptography_shapes_take_every_published_region_of_its_partition():
+    shapes = json.loads(regen_payment_cryptography_shapes.OUTPUT.read_text(encoding="utf-8"))["shapes"]
+    partitions = json.loads(
+        (regen_payment_cryptography_shapes.OUTPUT.parent / "partitions.json").read_text(encoding="utf-8"))["partitions"]
+    regions = [(partition["id"], region["id"]) for partition in partitions for region in partition["regions"]]
+
+    assert len(regions) >= 46
+    for partition, region in regions:
+        assert re.fullmatch(shapes["Region"]["pattern"], region), region
+        key = f"arn:{partition}:payment-cryptography:{region}:000000000000:key/0123456789abcdef"
+        alias = f"arn:{partition}:payment-cryptography:{region}:000000000000:alias/team/card-key"
+        assert re.fullmatch(shapes["KeyArn"]["pattern"], key), key
+        assert re.fullmatch(shapes["ResourceArn"]["pattern"], key), key
+        assert re.fullmatch(shapes["KeyArnOrKeyAliasType"]["pattern"], key), key
+        assert re.fullmatch(shapes["KeyArnOrKeyAliasType"]["pattern"], alias), alias
+
+
+@pytest.mark.parametrize("region", [
+    "us-gov", "us-gov-west-", "-gov-west-1", "u-gov-west-1", "europe-de-east-1", "US-GOV-WEST-1", "us_gov_west_1",
+])
+def test_payment_cryptography_shapes_refuse_what_is_not_a_region(region):
+    shapes = json.loads(regen_payment_cryptography_shapes.OUTPUT.read_text(encoding="utf-8"))["shapes"]
+
+    assert not re.fullmatch(shapes["Region"]["pattern"], region)
+    key = f"arn:aws:payment-cryptography:{region}:000000000000:key/0123456789abcdef"
+    for name in ("KeyArn", "KeyArnOrKeyAliasType", "ResourceArn"):
+        assert not re.fullmatch(shapes[name]["pattern"], key), name
+
+
+def test_payment_cryptography_shapes_take_the_key_an_arn_only_member_names():
+    doc = json.loads(regen_payment_cryptography_shapes.OUTPUT.read_text(encoding="utf-8"))
+
+    # KeyArn and ResourceArn take the ARN of a key alone; KeyIdentifier also takes an alias.
+    assert doc["shapes"]["KeyArn"]["pattern"].endswith("key/[0-9a-zA-Z]{16,64}")
+    assert "alias/" not in doc["shapes"]["KeyArn"]["pattern"]
+    assert "alias/" in doc["shapes"]["KeyArnOrKeyAliasType"]["pattern"]

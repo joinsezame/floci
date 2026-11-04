@@ -183,6 +183,19 @@ deleted, or not bound to the stage by a usage plan, with `403` `{"message":"Forb
 `x-amzn-ErrorType: ForbiddenException`, as AWS does. The header stays when the API customises its
 `INVALID_API_KEY` gateway response.
 
+#### API key source
+
+A REST API's `apiKeySource` is set with `CreateRestApi`, a `replace /apiKeySource` patch on
+`UpdateRestApi`, or an imported `x-amazon-apigateway-api-key-source`, and defaults to `HEADER`. Any
+other value is refused with `BadRequestException`. A stage export leaves the extension out, as AWS's
+does.
+
+With `AUTHORIZER`, the `x-api-key` header is not read. The key is the `usageIdentifierKey` the
+method's Lambda authorizer returns, checked against usage plans as above, and reported as
+`requestContext.identity.apiKey` and `apiKeyId` to a Lambda proxy integration. The authorizer's own
+event carries no key, since none is known before it runs. A method that requires a key and is not
+behind a Lambda authorizer then always answers `403`.
+
 ### REST Lambda Authorizers
 
 TOKEN and REQUEST authorizers must return a nonempty `principalId` and an IAM policy. Floci
@@ -217,7 +230,11 @@ A domain created with `CreateDomainName` is `AVAILABLE` at once. Its `regionalDo
 `<domain>.regional.local`, and a request whose `Host` header is either that name or the domain
 itself is routed through the domain's base path mappings to the mapped REST API stage. An
 `EDGE` domain also reports a `distributionDomainName` under `cloudfront.net` and the fixed
-CloudFront hosted zone `Z2FDTNDATAQYW2`; a `REGIONAL` domain reports neither, as on AWS. Moving a
+CloudFront hosted zone `Z2FDTNDATAQYW2`; a `REGIONAL` domain reports neither, as on AWS. The
+`regionalHostedZoneId` is the zone the [General Reference](https://docs.aws.amazon.com/general/latest/gr/apigateway.html)
+publishes for the domain's region, or the placeholder `Z2FDTNDATAQYL2`, which is no AWS zone, in a
+region the table does not list. The id is set at creation, so a stored domain keeps the one it
+was created with. Moving a
 domain between the two types with `UpdateDomainName` creates or drops the distribution. A
 domain created with no endpoint type is `EDGE`, as on AWS; it is `REGIONAL` when the request
 carries a regional certificate (`regionalCertificateArn` or `regionalCertificateName`) or the
@@ -719,6 +736,20 @@ Gateway v1 (`AWS`/Lambda mapping templates) and the AppSync resolver templates d
 
 ## API Gateway v2 (HTTP and WebSocket APIs) {#v2}
 
+### HTTP and WebSocket integration credentials
+
+V2 management APIs retain `credentialsArn` for integrations and
+`authorizerCredentialsArn` for REQUEST authorizers through create, update, get and
+list. Omitting either member on update preserves its stored value. HTTP API quick
+create retains integration credentials for Lambda ARN targets and ignores them for
+HTTP targets. OpenAPI import and CloudFormation API `Body` map the integration
+`credentials` and authorizer `authorizerCredentials` extensions to these fields.
+Integration copies and authorizer restore paths retain them too.
+
+This models credential selection; execution-role assumption and credential-based
+Lambda invocation authorization are not implemented by this change. Dedicated
+CloudFormation credential properties remain outside this support.
+
 **Protocol:** REST JSON
 **Endpoint:** `http://localhost:4566/v2/apis/...`
 
@@ -747,6 +778,16 @@ curl http://{apiId}.execute-api.{region}.localhost.floci.io:4566/{stageName}/{pa
 
 APIs created or updated with `disableExecuteApiEndpoint` reject requests to
 this default hostname with `404 Not Found`, matching AWS HTTP API behavior.
+
+HTTP API route selection prefers an exact method-and-path key. Otherwise, a
+matching non-greedy path outranks a greedy `{proxy+}` path; among comparable
+templates, literal segments outrank `{parameter}` segments at the first
+position where they differ. For `/pets/dog`, `GET /pets/dog` wins over
+`GET /pets/{pet}`, which wins over `GET /pets/{proxy+}`. Among greedy routes,
+a longer literal prefix such as `GET /pets/dogs/{proxy+}` wins over
+`GET /pets/{proxy+}`. For equally specific paths, a method-specific route
+wins over `ANY`; `$default` handles requests no other route matches. Route
+selection determines which route's authorizer and integration handle the request.
 
 HTTP API Lambda REQUEST authorizers resolve header, query string, context, and
 stage variable sources once, in configured order. Format `2.0` carries the values
@@ -839,6 +880,20 @@ The `integrationUri` names the backend:
 
 The request path is forwarded as received. The stage name is not added to it, and `tlsConfig` is not
 applied: the call to a Cloud Map instance uses plain HTTP.
+
+`$context.identity.sourceIp` is the address of the TCP connection to Floci, whatever `X-Forwarded-For`
+the client sent. An HTTP API `HTTP_PROXY` backend receives a `Forwarded` header holding the client's
+`X-Forwarded-For` entries and the client address, for example
+`Forwarded: for=198.51.100.7,for=192.0.2.43;by=10.0.0.1;host=api.example.test;proto=https`, and an
+`X-Forwarded-For` naming only the address Floci accepted the request on. A client's own `Forwarded`
+header is replaced. `$request.header.X-Forwarded-For` mappings still see the client's value. The
+[API Gateway important notes](https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-known-issues.html)
+say HTTP APIs translate `X-Forwarded-*` into `Forwarded` and append the egress IP, Host and protocol.
+They do not give the syntax or the `X-Forwarded-For` value, which follow third-party descriptions of
+observed behavior. Floci translates only `X-Forwarded-For`: `X-Forwarded-Host`, `X-Forwarded-Proto` and
+`X-Forwarded-Port` reach the backend as the client sent them.
+An ALB HTTP or HTTPS listener integration goes through the listener, which adds its own hop. An NLB TCP
+listener relays the request unchanged and does not add a hop.
 
 ### Supported Operations
 

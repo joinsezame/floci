@@ -366,6 +366,7 @@ public interface EmulatorConfig {
         CloudWatchLogsStorageConfig cloudwatchlogs();
         CloudWatchMetricsStorageConfig cloudwatchmetrics();
         SecretsManagerStorageConfig secretsmanager();
+        PaymentCryptographyStorageConfig paymentcryptography();
         AcmStorageConfig acm();
         OpenSearchStorageConfig opensearch();
         AppConfigStorageConfig appconfig();
@@ -482,6 +483,13 @@ public interface EmulatorConfig {
     }
 
     interface SecretsManagerStorageConfig {
+        Optional<String> mode();
+
+        @WithDefault("5000")
+        long flushIntervalMs();
+    }
+
+    interface PaymentCryptographyStorageConfig {
         Optional<String> mode();
 
         @WithDefault("5000")
@@ -763,6 +771,7 @@ public interface EmulatorConfig {
         RedshiftDataServiceConfig redshiftData();
         RedshiftServerlessServiceConfig redshiftServerless();
         EventBridgeServiceConfig eventbridge();
+        EventBridgeV2ServiceConfig eventbridgev2();
         CloudMapServiceConfig cloudmap();
         EmrServiceConfig emr();
         WafV2ServiceConfig wafv2();
@@ -770,6 +779,7 @@ public interface EmulatorConfig {
         CloudWatchLogsServiceConfig cloudwatchlogs();
         CloudWatchMetricsServiceConfig cloudwatchmetrics();
         SecretsManagerServiceConfig secretsmanager();
+        PaymentCryptographyServiceConfig paymentcryptography();
         ApiGatewayV2ServiceConfig apigatewayv2();
         KinesisServiceConfig kinesis();
         FirehoseServiceConfig firehose();
@@ -1107,7 +1117,8 @@ public interface EmulatorConfig {
 
         /**
          * {@code immediate} follows the job run states without running anything; {@code docker} runs
-         * each Spark job run's {@code spark-submit} in a container of the release's EMR Serverless image.
+         * each Spark job run's {@code spark-submit}, and each Hive job run's {@code hive}, in a container of the
+         * application's custom image, or else of the release's EMR Serverless image.
          */
         @WithDefault("immediate")
         String runnerMode();
@@ -1115,11 +1126,20 @@ public interface EmulatorConfig {
         Optional<String> dockerNetwork();
 
         /**
-         * The image a {@code docker} job run uses, with {@code %s} standing for the application's
-         * release label, for example "registry.internal/emr-serverless/spark/%s:20250425". If omitted,
-         * Floci uses the release's public image on Amazon ECR Public.
+         * The image a {@code docker} job run uses when its application names no custom image, with
+         * {@code %s} standing for the application's release label, for example
+         * "registry.internal/emr-serverless/spark/%s:20250425". If omitted, Floci uses the release's public
+         * image on Amazon ECR Public.
          */
         Optional<String> imageTemplate();
+
+        /**
+         * The image a {@code docker} Hive job run uses when its application names no custom image, as
+         * {@link #imageTemplate()} is for a Spark run, for example
+         * "registry.internal/emr-serverless/hive/%s:20250425". If omitted, Floci uses the release's public
+         * Hive image on Amazon ECR Public.
+         */
+        Optional<String> hiveImageTemplate();
 
         /**
          * When true, Floci removes, in the {@code docker} runner mode, every EMR Serverless driver a
@@ -1238,17 +1258,13 @@ public interface EmulatorConfig {
         @WithDefault("true")
         boolean enabled();
 
-        @WithDefault("ns-1.awsdns-01.org")
-        String defaultNameserver1();
+        Optional<String> defaultNameserver1();
 
-        @WithDefault("ns-2.awsdns-02.net")
-        String defaultNameserver2();
+        Optional<String> defaultNameserver2();
 
-        @WithDefault("ns-3.awsdns-03.com")
-        String defaultNameserver3();
+        Optional<String> defaultNameserver3();
 
-        @WithDefault("ns-4.awsdns-04.co.uk")
-        String defaultNameserver4();
+        Optional<String> defaultNameserver4();
 
         /**
          * Optional control-plane processing window for VPC association mutations. A positive
@@ -1734,6 +1750,16 @@ public interface EmulatorConfig {
         boolean cloudwatchMetricsEnabled();
         @WithDefault("60")
         long snapshotSweepIntervalSeconds();
+
+        /**
+         * Copy snapshots of clusters with snapshot copy enabled into the destination Region.
+         * Env: FLOCI_SERVICES_REDSHIFT_SNAPSHOT_COPY_ENABLED
+         */
+        @WithDefault("true")
+        boolean snapshotCopyEnabled();
+
+        @WithDefault("60")
+        long snapshotCopySweepIntervalSeconds();
         @WithDefault("true")
         boolean enabled();
         @WithDefault("5439")
@@ -1797,6 +1823,13 @@ public interface EmulatorConfig {
 
         /** Empty when Floci should adapt its built-in image to the requested engine version. */
         Optional<String> defaultPostgresImage();
+
+        /**
+         * S3 bucket a snapshot export stages each table's rows and Parquet in, before the finished
+         * Parquet is written to the export's own bucket. Created on first use if it doesn't exist.
+         */
+        @WithDefault("floci-rds-export-staging")
+        String exportStagingBucket();
 
         /** Empty when Floci should adapt its built-in image to the requested engine version. */
         Optional<String> defaultMysqlImage();
@@ -1910,6 +1943,18 @@ public interface EmulatorConfig {
         boolean enabled();
 
         @WithDefault("true")
+        boolean snapshotExpirationEnabled();
+
+        @WithDefault("60")
+        int snapshotExpirationSweepIntervalSeconds();
+
+        @WithDefault("true")
+        boolean snapshotCopyEnabled();
+
+        @WithDefault("60")
+        int snapshotCopySweepIntervalSeconds();
+
+        @WithDefault("true")
         boolean scheduledActionsEnabled();
 
         @WithDefault("60")
@@ -1965,6 +2010,11 @@ public interface EmulatorConfig {
         boolean enabled();
     }
 
+    interface EventBridgeV2ServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+    }
+
     interface CloudMapServiceConfig {
         @WithDefault("true")
         boolean enabled();
@@ -1999,7 +2049,8 @@ public interface EmulatorConfig {
 
         /**
          * {@code immediate} completes each step by time without running anything; {@code docker} runs each
-         * Spark step's {@code spark-submit} in a container of the release's EMR Serverless image.
+         * Spark step's {@code spark-submit} in a container of the release's EMR Serverless image, which a cluster
+         * with Hive has Hive added to, and that cluster's Hive steps' {@code hive} too.
          */
         @WithDefault("immediate")
         String runnerMode();
@@ -2012,6 +2063,14 @@ public interface EmulatorConfig {
          * release's public EMR Serverless image on Amazon ECR Public.
          */
         Optional<String> imageTemplate();
+
+        /**
+         * The EMR Serverless Hive image a {@code docker} cluster with Hive takes Hive from, into the image its
+         * bootstrap and steps run in, as {@link #imageTemplate()} names the image Hive is added to, for example
+         * "registry.internal/emr-serverless/hive/%s:20250425". If omitted, Floci uses the release's public EMR
+         * Serverless Hive image on Amazon ECR Public.
+         */
+        Optional<String> hiveImageTemplate();
 
         /**
          * When true, Floci removes, in the {@code docker} runner mode, every EMR step driver and bootstrap
@@ -2078,6 +2137,11 @@ public interface EmulatorConfig {
     }
 
     interface CloudWatchMetricsServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+    }
+
+    interface PaymentCryptographyServiceConfig {
         @WithDefault("true")
         boolean enabled();
     }
@@ -3390,6 +3454,16 @@ public interface EmulatorConfig {
          * Env var: FLOCI_SERVICES_EC2_CONTAINER_IPS_ROUTABLE
          */
         Optional<Boolean> containerIpsRoutable();
+
+        /**
+         * When Floci itself runs as a container, report an instance's address on Floci's own
+         * Docker network as its public IP, so clients on that network (an orchestrator, a worker
+         * running Ansible) reach the guest's real ports there, as they would an AWS public IP.
+         *
+         * Env var: FLOCI_SERVICES_EC2_PUBLIC_IP_FROM_SERVICE_NETWORK
+         */
+        @WithDefault("false")
+        boolean publicIpFromServiceNetwork();
 
         /**
          * When true, Floci removes on startup any EC2 instance container left on the Docker

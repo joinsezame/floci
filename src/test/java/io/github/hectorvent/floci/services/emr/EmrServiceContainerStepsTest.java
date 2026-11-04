@@ -30,10 +30,13 @@ import static io.github.hectorvent.floci.services.emr.EmrServiceFixture.ACCOUNT;
 import static io.github.hectorvent.floci.services.emr.EmrServiceFixture.REGION;
 import static io.github.hectorvent.floci.services.emr.EmrServiceFixture.cluster;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
+import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
@@ -63,7 +66,10 @@ class EmrServiceContainerStepsTest {
     void aStepRunsInAContainerFromWhenItStartsUntilItsDriverExits() {
         EmrCluster requested = cluster("real", true, sparkStep("report", "CONTINUE"));
         requested.setConfigurations("""
-                [{"Classification": "spark-defaults", "Properties": {"spark.executor.cores": "2"}}]""");
+                [{"Classification": "spark-defaults", "Properties": {"spark.executor.cores": "2"}},
+                 {"Classification": "spark-hive-site", "Properties": {"hive.metastore.glue.catalogid": "111122223333"}},
+                 {"Classification": "spark-env", "Configurations": [
+                   {"Classification": "export", "Properties": {"PYSPARK_PYTHON": "/usr/bin/python3.11"}}]}]""");
         EmrCluster cluster = service.runJobFlow(requested, REGION);
         String stepId = cluster.getSteps().get(0).getId();
 
@@ -88,10 +94,63 @@ class EmrServiceContainerStepsTest {
         assertNull(job.dockerNetwork());
         assertEquals(List.of(REPORT, "s3://bucket/out/"), job.application());
         assertNull(job.command());
-        assertEquals(Map.of("spark.executor.cores", "2"), job.sparkDefaults());
+        assertEquals(Map.of("spark.executor.cores", "2", "spark.hadoop.hive.metastore.glue.catalogid", "111122223333"),
+                job.sparkDefaults());
         assertEquals(Duration.ZERO, job.timeout());
         assertNull(job.logFolder());
         assertNull(job.cloudWatchLogs());
+        assertEquals(Map.of("PYSPARK_PYTHON", "/usr/bin/python3.11"), job.environment());
+        assertEquals(new SparkJobRunner.Storage(cluster.getId() + "-home", cluster.getId() + "-mnt"), job.storage());
+        assertEquals(List.of(cluster.getId()), fixture.clusterStorage.created);
+    }
+
+    @Test
+    void aCustomJarStepGetsItsPropertiesAndItsClustersCoreSiteAndSparkLog4j2() {
+        EmrStep report = sparkStep("report", "CONTINUE");
+        report.setJar("s3://bucket/jobs/report.jar");
+        report.setMainClass("com.example.Report");
+        report.setArgs(List.of("2026-11-01"));
+        report.setProperties(Map.of("report.title", "Nightly"));
+        EmrCluster requested = cluster("configured", true, report);
+        requested.setConfigurations("""
+                [{"Classification": "core-site", "Properties": {"fs.s3a.connection.maximum": "50"}},
+                 {"Classification": "spark-log4j2", "Properties": {"rootLogger.level": "warn"}}]""");
+        service.runJobFlow(requested, REGION);
+
+        fixture.runStepThread();
+
+        SparkJobRunner.Job job = runner.jobs.get(0);
+        assertEquals(List.of("--class", "com.example.Report", "s3://bucket/jobs/report.jar", "2026-11-01"),
+                job.application());
+        assertEquals(Map.of("SPARK_SUBMIT_OPTS", "'-Dreport.title=Nightly'"), job.environment());
+        assertEquals(Map.of("spark.hadoop.fs.s3a.connection.maximum", "50"), job.sparkDefaults());
+        assertEquals(Map.of("fs.s3a.connection.maximum", "50"), job.coreSite());
+        assertEquals(Map.of("rootLogger.level", "warn"), job.sparkLog4j2());
+    }
+
+    @Test
+    void aMapReduceCustomJarStepGetsItsClustersMapredSiteHadoopLog4jAndHadoopEnv() {
+        // The Management Guide's custom JAR step, the word count of Hadoop's MapReduce examples.
+        EmrStep wordCount = sparkStep("word-count", "CONTINUE");
+        wordCount.setJar("s3://bucket/jars/hadoop-mapreduce-examples-3.4.0-amzn-1.jar");
+        wordCount.setArgs(List.of("wordcount", "s3://bucket/input/input.txt", "s3://bucket/output/"));
+        EmrCluster requested = cluster("mapreduce", true, wordCount);
+        requested.setConfigurations("""
+                [{"Classification": "mapred-site", "Properties": {"mapreduce.job.reduces": "1"}},
+                 {"Classification": "hadoop-log4j", "Properties": {"log4j.logger.org.apache.hadoop": "WARN"}},
+                 {"Classification": "hadoop-env", "Configurations": [
+                   {"Classification": "export", "Properties": {"HADOOP_CLASSPATH": "/path/to/my.jar"}}]}]""");
+        service.runJobFlow(requested, REGION);
+
+        fixture.runStepThread();
+
+        SparkJobRunner.Job job = runner.jobs.get(0);
+        assertEquals(List.of("s3://bucket/jars/hadoop-mapreduce-examples-3.4.0-amzn-1.jar", "wordcount",
+                "s3://bucket/input/input.txt", "s3://bucket/output/"), job.application());
+        assertEquals(Map.of("mapreduce.job.reduces", "1"), job.mapredSite());
+        assertEquals(Map.of("log4j.logger.org.apache.hadoop", "WARN"), job.hadoopLog4j());
+        assertEquals(Map.of("HADOOP_CLASSPATH", "/path/to/my.jar"), job.hadoopEnvironment());
+        assertEquals(Map.of(), job.environment());
     }
 
     @Test
@@ -258,9 +317,9 @@ class EmrServiceContainerStepsTest {
 
     @Test
     void aStepFlociDoesNotRunFailsWithoutRunning() {
-        EmrStep hive = sparkStep("query", "CONTINUE");
-        hive.setArgs(List.of("hive-script", "--run-hive-script", "--args", "-f", "s3://bucket/query.q"));
-        EmrCluster cluster = service.runJobFlow(cluster("hive", true, hive), REGION);
+        EmrStep pig = sparkStep("query", "CONTINUE");
+        pig.setArgs(List.of("pig-script", "--run-pig-script", "--args", "-f", "s3://bucket/query.pig"));
+        EmrCluster cluster = service.runJobFlow(cluster("pig", true, pig), REGION);
 
         fixture.runStepThread();
 
@@ -268,6 +327,39 @@ class EmrServiceContainerStepsTest {
         assertEquals("FAILED", failed.getState());
         assertEquals(EmrSparkSteps.NOT_RUN, failed.getFailureMessage());
         assertEquals(List.of(), runner.jobs);
+    }
+
+    @Test
+    void aStreamingStepRunsItsCommandOnTheClustersStorage() {
+        EmrStep streaming = sparkStep("Streaming program", "CONTINUE");
+        List<String> args = List.of("hadoop-streaming", "-files", "s3://bucket/mapper.py", "-mapper", "mapper.py",
+                "-reducer", "aggregate", "-input", "s3://bucket/input/", "-output", "s3://bucket/output/");
+        streaming.setArgs(new ArrayList<>(args));
+        EmrCluster cluster = service.runJobFlow(cluster("streaming", true, streaming), REGION);
+
+        fixture.runStepThread();
+
+        assertEquals("COMPLETED", service.describeStep(cluster.getId(), cluster.getSteps().get(0).getId()).getState());
+        SparkJobRunner.Job job = runner.jobs.get(0);
+        assertEquals(args, job.command());
+        assertEquals(new SparkJobRunner.Storage(cluster.getId() + "-home", cluster.getId() + "-mnt"), job.storage());
+    }
+
+    @Test
+    void anS3DistCpStepRunsFlocisS3DistCpOnTheClustersStorage() {
+        EmrStep copy = sparkStep("copy", "CONTINUE");
+        copy.setArgs(new ArrayList<>(List.of("s3-dist-cp", "--src=s3://bucket/logs/", "--dest=hdfs:///output")));
+        EmrCluster cluster = service.runJobFlow(cluster("copying", true, copy), REGION);
+
+        fixture.runStepThread();
+
+        assertEquals("COMPLETED", service.describeStep(cluster.getId(), cluster.getSteps().get(0).getId()).getState());
+        SparkJobRunner.Job job = runner.jobs.get(0);
+        assertEquals(List.of("bash", "-c"), job.command().subList(0, 2));
+        assertEquals(List.of("s3-dist-cp", "--src=s3://bucket/logs/", "--dest=hdfs:///output"),
+                job.command().subList(3, job.command().size()));
+        assertEquals(List.of(), job.application());
+        assertEquals(new SparkJobRunner.Storage(cluster.getId() + "-home", cluster.getId() + "-mnt"), job.storage());
     }
 
     @Test
@@ -441,21 +533,24 @@ class EmrServiceContainerStepsTest {
     }
 
     @Test
-    void leftoverDriversAndBootstrapImagesAreRemovedWhenTheServiceStartsUnlessReconcilingIsOff() {
+    void leftoverDriversBootstrapImagesAndStorageAreRemovedWhenTheServiceStartsUnlessReconcilingIsOff() {
         for (boolean reconcile : List.of(true, false)) {
             EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
             when(config.services().emr().runnerMode()).thenReturn("docker");
             when(config.services().emr().reconcileContainersOnStartup()).thenReturn(reconcile);
             EmrServerlessSparkRunner sparkRunner = mock(EmrServerlessSparkRunner.class);
             EmrBootstrapRunner bootstrapRunner = mock(EmrBootstrapRunner.class);
+            EmrClusterStorage clusterStorage = mock(EmrClusterStorage.class);
             RegionResolver regionResolver = new RegionResolver(REGION, ACCOUNT);
 
             new EmrService(new InMemoryStorageFactory(ACCOUNT), config, regionResolver,
                     new EmrEventPublisher(mock(EventBridgeService.class), new ObjectMapper(), regionResolver),
-                    sparkRunner, bootstrapRunner, mock(IamService.class)).shutdown();
+                    sparkRunner, bootstrapRunner, clusterStorage, mock(EmrReleaseImages.class), mock(IamService.class))
+                    .shutdown();
 
             verify(sparkRunner, times(reconcile ? 1 : 0)).removeLeftoverDrivers("emr");
             verify(bootstrapRunner, times(reconcile ? 1 : 0)).removeImages(Set.of());
+            verify(clusterStorage, times(reconcile ? 1 : 0)).removeAllBut(Set.of());
         }
     }
 
@@ -493,6 +588,8 @@ class EmrServiceContainerStepsTest {
         bootstrapping.runStepThread();
 
         assertEquals(IMAGE, runner.jobs.get(0).imageTemplate());
+        // A cluster without Hive runs in the release's EMR Serverless image, which none makes.
+        assertEquals(List.of(), bootstrapping.releaseImages.asked);
         assertEquals("COMPLETED", bootstrapping.service.describeStep(cluster.getId(), stepId).getState());
         assertEquals(List.of("STARTING", "PENDING report", "RUNNING report", "COMPLETED report", "WAITING"),
                 bootstrapping.states());
@@ -509,6 +606,126 @@ class EmrServiceContainerStepsTest {
 
         assertTrue(bootstrap.bootstraps.isEmpty());
         assertNull(runner.jobs.get(0).imageTemplate());
+    }
+
+    @Test
+    void aHiveStepOnAClusterWithHiveRunsHiveScriptsHiveOnTheClustersStorage() {
+        EmrStep query = hiveStep("report", "-f", "s3://bucket/queries/report.q", "-d", "INPUT=s3://bucket/in/");
+        EmrCluster requested = cluster("hive", true, query);
+        requested.setApplications("[{\"Name\": \"Hive\"}, {\"Name\": \"Spark\"}]");
+        requested.setLogUri("s3://logs/emr/");
+        requested.setConfigurations("""
+                [{"Classification": "hive-site", "Properties": {"hive.exec.reducers.max": "8"}},
+                 {"Classification": "hive-env", "Configurations": [
+                   {"Classification": "export", "Properties": {"HADOOP_HEAPSIZE": "2048"}}]},
+                 {"Classification": "spark-defaults", "Properties": {"spark.executor.cores": "2"}},
+                 {"Classification": "spark-env", "Configurations": [
+                   {"Classification": "export", "Properties": {"PYSPARK_PYTHON": "/usr/bin/python3.11"}}]}]""");
+        EmrCluster cluster = service.runJobFlow(requested, REGION);
+        String stepId = cluster.getSteps().get(0).getId();
+
+        fixture.runStepThread();
+
+        SparkJobRunner.Job job = runner.jobs.get(0);
+        assertEquals(SparkJobRunner.Engine.HIVE, job.engine());
+        assertEquals(stepId, job.runId());
+        // The release's EMR Serverless image with its EMR Serverless Hive image's Hive, made on the step's thread.
+        assertEquals(List.of(List.of("emr-7.5.0", "public.ecr.aws/emr-serverless/spark/emr-7.5.0:latest",
+                "public.ecr.aws/emr-serverless/hive/emr-7.5.0:latest")), fixture.releaseImages.asked);
+        assertEquals(EmrServiceFixture.RecordingReleaseImages.IMAGE, job.imageTemplate());
+        assertNull(job.customImage());
+        assertEquals(List.of("hive-script", "--run-hive-script", "--args"), job.command());
+        assertEquals(List.of("--hiveconf", "hive.exec.reducers.max=8", "-f", "s3://bucket/queries/report.q", "-d",
+                "INPUT=s3://bucket/in/"), job.application());
+        // Its cluster's Spark settings are not Hive's.
+        assertEquals(Map.of(), job.sparkDefaults());
+        assertEquals(Map.of("HADOOP_HEAPSIZE", "2048"), job.environment());
+        assertEquals(new SparkJobRunner.Storage(cluster.getId() + "-home", cluster.getId() + "-mnt"), job.storage());
+        assertEquals("s3://logs/emr/" + cluster.getId() + "/steps/" + stepId + "/", job.logFolder());
+        assertEquals(List.of(cluster.getId()), fixture.clusterStorage.created);
+        assertEquals("COMPLETED", service.describeStep(cluster.getId(), stepId).getState());
+    }
+
+    @Test
+    void aClusterWithHivesImageIsMadeOfTheImagesTheTemplatesNameAndItsSparkStepsRunInItToo() {
+        EmrService templated = fixture.withHiveImageTemplate("registry.internal/emr-serverless/hive/%s:20250425");
+        EmrCluster requested = cluster("templated", true, sparkStep("report", "CONTINUE"));
+        requested.setApplications("[{\"Name\": \"Hive\"}, {\"Name\": \"Spark\"}]");
+        templated.runJobFlow(requested, REGION);
+
+        fixture.runStepThread();
+
+        assertEquals(List.of(List.of("emr-7.5.0", "public.ecr.aws/emr-serverless/spark/emr-7.5.0:latest",
+                "registry.internal/emr-serverless/hive/emr-7.5.0:20250425")), fixture.releaseImages.asked);
+        assertEquals(SparkJobRunner.Engine.SPARK, runner.jobs.get(0).engine());
+        assertEquals(EmrServiceFixture.RecordingReleaseImages.IMAGE, runner.jobs.get(0).imageTemplate());
+    }
+
+    @Test
+    void aBootstrappedClusterWithHiveBootstrapsInItsImageAndItsStepsRunInTheImageTheBootstrapLeft() {
+        EmrServiceFixture bootstrapping = EmrServiceFixture.docker(runner, bootstrap, null);
+        EmrCluster requested = bootstrapped(cluster("bootstrapped-hive", true, hiveStep("report", "-e", "select 1")));
+        requested.setApplications("[{\"Name\": \"Hive\"}]");
+        bootstrapping.service.runJobFlow(requested, REGION);
+
+        bootstrapping.runStepThread();
+        bootstrapping.runStepThread();
+
+        assertEquals(EmrServiceFixture.RecordingReleaseImages.IMAGE, bootstrap.bootstraps.get(0).imageTemplate());
+        assertEquals(SparkJobRunner.Engine.HIVE, runner.jobs.get(0).engine());
+        assertEquals(IMAGE, runner.jobs.get(0).imageTemplate());
+        // Made once, for the bootstrap: the image it left holds it.
+        assertEquals(1, bootstrapping.releaseImages.asked.size());
+    }
+
+    @Test
+    void aClusterWithHiveThatEndsBeforeItsBootstrapOrStepRunsMakesNoImage() {
+        EmrServiceFixture bootstrapping = EmrServiceFixture.docker(runner, bootstrap, null);
+        EmrCluster unbooted = bootstrapped(cluster("ended-bootstrapping", true));
+        unbooted.setApplications("[{\"Name\": \"Hive\"}]");
+        String unbootedId = bootstrapping.service.runJobFlow(unbooted, REGION).getId();
+        EmrCluster unrun = cluster("ended-running", true, hiveStep("report", "-e", "select 1"));
+        unrun.setApplications("[{\"Name\": \"Hive\"}]");
+        String unrunId = service.runJobFlow(unrun, REGION).getId();
+
+        bootstrapping.service.terminateJobFlows(List.of(unbootedId));
+        service.terminateJobFlows(List.of(unrunId));
+        bootstrapping.runStepThread();
+        fixture.runStepThread();
+
+        // Each image would be pulled, several GB, and made: a thread that comes after the cluster's end makes none.
+        assertEquals(List.of(), bootstrapping.releaseImages.asked);
+        assertEquals(List.of(), fixture.releaseImages.asked);
+    }
+
+    @Test
+    void anImageWithHiveThatCannotBeMadeFailsTheStepOrEndsTheBootstrappingCluster() {
+        fixture.releaseImages.failure = new IllegalStateException("Could not pull the Hive image");
+        EmrCluster requested = cluster("unmade", true, hiveStep("report", "-e", "select 1"));
+        requested.setApplications("[{\"Name\": \"Hive\"}]");
+        EmrCluster cluster = service.runJobFlow(requested, REGION);
+
+        fixture.runStepThread();
+
+        EmrStep failed = service.describeStep(cluster.getId(), cluster.getSteps().get(0).getId());
+        assertEquals("FAILED", failed.getState());
+        assertEquals("The step could not start: Could not pull the Hive image", failed.getFailureMessage());
+        assertEquals(List.of(), runner.jobs);
+
+        EmrServiceFixture bootstrapping = EmrServiceFixture.docker(runner, bootstrap, null);
+        bootstrapping.releaseImages.failure = new IllegalStateException("Could not pull the Hive image");
+        EmrCluster unbooted = bootstrapped(cluster("unbooted", true));
+        unbooted.setApplications("[{\"Name\": \"Hive\"}]");
+        String unbootedId = bootstrapping.service.runJobFlow(unbooted, REGION).getId();
+
+        bootstrapping.runStepThread();
+
+        EmrCluster ended = bootstrapping.service.describeCluster(unbootedId);
+        assertEquals("TERMINATED_WITH_ERRORS", ended.getState());
+        assertEquals(List.of("INTERNAL_ERROR",
+                "Floci could not run the bootstrap actions: Could not pull the Hive image"),
+                List.of(ended.getStateChangeReasonCode(), ended.getStateChangeMessage()));
+        assertEquals(List.of(), bootstrap.bootstraps);
     }
 
     @Test
@@ -617,6 +834,122 @@ class EmrServiceContainerStepsTest {
     }
 
     @Test
+    void aClustersStepsShareItsStorageWhichGoesOnceItHasEndedAndItsLastStepIsDone() {
+        EmrCluster cluster = service.runJobFlow(cluster("shared", false, sparkStep("load", "CONTINUE"),
+                sparkStep("report", "CONTINUE")), REGION);
+        fixture.runStepThread();
+        // The second step's driver, still running as its cluster ends, still needs the storage, however often
+        // the cluster is read meanwhile.
+        List<Integer> threadsAsTheClusterEnded = new ArrayList<>();
+        runner.whileRunning = () -> {
+            service.terminateJobFlows(List.of(cluster.getId()));
+            service.describeCluster(cluster.getId());
+            threadsAsTheClusterEnded.add(fixture.stepThreadsWaiting());
+        };
+
+        fixture.runStepThread();
+        assertEquals(List.of(0), threadsAsTheClusterEnded);
+        assertTrue(service.describeCluster(cluster.getId()).isStorageCreated());
+        fixture.runStepThread();
+
+        SparkJobRunner.Storage storage = new SparkJobRunner.Storage(cluster.getId() + "-home",
+                cluster.getId() + "-mnt");
+        assertEquals(List.of(storage, storage), runner.jobs.stream().map(SparkJobRunner.Job::storage).toList());
+        assertEquals(List.of(cluster.getId()), fixture.clusterStorage.removed);
+        assertFalse(service.describeCluster(cluster.getId()).isStorageCreated());
+        assertEquals(0, fixture.stepThreadsWaiting());
+    }
+
+    @Test
+    void theStorageOfAClusterItsLastStepEndedGoesWithoutTheClusterBeingReadAgain() {
+        EmrCluster cluster = service.runJobFlow(cluster("finished", false, sparkStep("report", "CONTINUE")), REGION);
+
+        fixture.runStepThread();
+        // The step's end ended the cluster, and its storage's removal is on a thread of its own already.
+        assertEquals(1, fixture.stepThreadsWaiting());
+        fixture.runStepThread();
+
+        assertEquals(List.of(cluster.getId()), fixture.clusterStorage.removed);
+        EmrCluster ended = service.describeCluster(cluster.getId());
+        assertEquals("TERMINATED", ended.getState());
+        assertFalse(ended.isStorageCreated());
+    }
+
+    @Test
+    void storageMadeAsAResetSweptGoesOnceItsStepsThreadIsDone() {
+        EmrCluster cluster = service.runJobFlow(cluster("reset", true, sparkStep("load", "CONTINUE")), REGION);
+        // The reset sweeps every cluster's storage while the step's thread is making it.
+        fixture.clusterStorage.whileCreating = service::beforeReset;
+
+        fixture.runStepThread();
+
+        assertEquals(List.of(Set.of()), fixture.clusterStorage.kept);
+        assertEquals(List.of(cluster.getId()), fixture.clusterStorage.removed);
+        assertEquals(List.of(), runner.driversStarted);
+    }
+
+    @Test
+    void storageDockerRefusesToRemoveIsTriedAgainTheNextTimeItsClusterIsRead() {
+        EmrCluster cluster = service.runJobFlow(cluster("refused", true, sparkStep("load", "CONTINUE")), REGION);
+        fixture.runStepThread();
+        fixture.clusterStorage.refuse = true;
+        service.terminateJobFlows(List.of(cluster.getId()));
+
+        // One removal at a time, however often the cluster is read meanwhile.
+        service.describeCluster(cluster.getId());
+        assertEquals(1, fixture.stepThreadsWaiting());
+        fixture.runStepThread();
+        // Refused: the cluster still keeps its storage, and reading it tries again.
+        assertTrue(service.describeCluster(cluster.getId()).isStorageCreated());
+        fixture.clusterStorage.refuse = false;
+        fixture.runStepThread();
+
+        assertEquals(List.of(cluster.getId(), cluster.getId()), fixture.clusterStorage.removed);
+        assertFalse(service.describeCluster(cluster.getId()).isStorageCreated());
+        assertEquals(0, fixture.stepThreadsWaiting());
+    }
+
+    @Test
+    void aClusterWhoseStepsNoContainerRanHasNoStorage() {
+        EmrStep query = sparkStep("query", "CONTINUE");
+        query.setArgs(new ArrayList<>(List.of("pig-script", "--run-pig-script", "--args", "-f", "s3://bucket/q.pig")));
+        EmrCluster cluster = service.runJobFlow(cluster("unrun", true, query), REGION);
+        fixture.runStepThread();
+
+        service.terminateJobFlows(List.of(cluster.getId()));
+
+        assertFalse(service.describeCluster(cluster.getId()).isStorageCreated());
+        assertEquals(List.of(), fixture.clusterStorage.created);
+        assertEquals(List.of(), fixture.clusterStorage.removed);
+        assertEquals(0, fixture.stepThreadsWaiting());
+    }
+
+    @Test
+    void theStorageOfClustersThatAreGoneOrHaveEndedIsRemovedBeforeARestartedClusterCanMoveOn() {
+        // Its step was running as Floci stopped: the wakeup that fails it could start another step.
+        EmrCluster up = service.runJobFlow(cluster("up", true, sparkStep("cut", "CONTINUE")), REGION);
+        EmrCluster ended = service.runJobFlow(cluster("ended", true), REGION);
+        service.terminateJobFlows(List.of(ended.getId()));
+        EmrService.Wakeups wakeups = mock(EmrService.Wakeups.class);
+        doAnswer(invocation -> {
+            assertEquals(List.of(Set.of(up.getId())), fixture.clusterStorage.kept);
+            return null;
+        }).when(wakeups).at(any(), any());
+
+        fixture.restartReconciling(mock(SparkJobRunner.class), wakeups);
+
+        verify(wakeups, atLeastOnce()).at(any(), any());
+        assertEquals(List.of(Set.of(up.getId())), fixture.clusterStorage.kept);
+    }
+
+    @Test
+    void aResetRemovesTheStorageOfEveryCluster() {
+        service.beforeReset();
+
+        assertEquals(List.of(Set.of()), fixture.clusterStorage.kept);
+    }
+
+    @Test
     void aClusterARestartLeftBootstrappingEndsWithErrors() {
         EmrServiceFixture bootstrapping = EmrServiceFixture.docker(runner, bootstrap, null);
         EmrCluster cluster = bootstrapping.service.runJobFlow(bootstrapped(cluster("interrupted", true)), REGION);
@@ -653,6 +986,18 @@ class EmrServiceContainerStepsTest {
     }
 
     // A spark-submit step through command-runner.jar, written for a cluster with YARN.
+    // The AWS CLI's Hive step: command-runner.jar running hive-script with the step's arguments after its --args.
+    private static EmrStep hiveStep(String name, String... args) {
+        EmrStep step = new EmrStep();
+        step.setName(name);
+        step.setActionOnFailure("CONTINUE");
+        step.setJar("command-runner.jar");
+        List<String> command = new ArrayList<>(List.of("hive-script", "--run-hive-script", "--args"));
+        command.addAll(List.of(args));
+        step.setArgs(command);
+        return step;
+    }
+
     private static EmrStep sparkStep(String name, String actionOnFailure) {
         EmrStep step = new EmrStep();
         step.setName(name);

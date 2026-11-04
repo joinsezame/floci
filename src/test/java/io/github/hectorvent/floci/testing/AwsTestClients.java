@@ -5,6 +5,7 @@ import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.awscore.client.builder.AwsClientBuilder;
 import software.amazon.awssdk.awscore.client.builder.AwsSyncClientBuilder;
+import software.amazon.awssdk.http.SdkHttpClient;
 import software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient;
 import software.amazon.awssdk.regions.Region;
 
@@ -18,9 +19,42 @@ public final class AwsTestClients {
 
     public static <B extends AwsClientBuilder<B, C> & AwsSyncClientBuilder<B, C>, C> C create(
             B builder, String account, Region region) {
-        return builder.endpointOverride(URI.create("http://localhost:" + RestAssured.port))
-                .httpClientBuilder(UrlConnectionHttpClient.builder()).region(region)
-                .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(account, "test")))
+        return create(builder, account, region, UrlConnectionHttpClient.builder());
+    }
+
+    /** Selects a transport explicitly for operations requiring methods such as PATCH. */
+    public static <B extends AwsClientBuilder<B, C> & AwsSyncClientBuilder<B, C>, C> C create(
+            B builder, String account, Region region, SdkHttpClient.Builder<?> httpClientBuilder) {
+        return create(builder, account, region, httpClientBuilder, URI.create("http://localhost:" + RestAssured.port));
+    }
+
+    /** Explicit endpoint for class fixtures created before RestAssured's per-test port is installed. */
+    public static <B extends AwsClientBuilder<B, C> & AwsSyncClientBuilder<B, C>, C> C create(
+            B builder, String account, Region region, URI endpoint) {
+        return create(builder, account, region, UrlConnectionHttpClient.builder(), endpoint);
+    }
+
+    public static <B extends AwsClientBuilder<B, C> & AwsSyncClientBuilder<B, C>, C> C create(
+            B builder, String accessKey, String secretKey, Region region) {
+        return create(builder, accessKey, secretKey, region, URI.create("http://localhost:" + RestAssured.port));
+    }
+
+    public static <B extends AwsClientBuilder<B, C> & AwsSyncClientBuilder<B, C>, C> C create(
+            B builder, String accessKey, String secretKey, Region region, URI endpoint) {
+        return create(builder, accessKey, secretKey, region, UrlConnectionHttpClient.builder(), endpoint);
+    }
+
+    private static <B extends AwsClientBuilder<B, C> & AwsSyncClientBuilder<B, C>, C> C create(
+            B builder, String account, Region region, SdkHttpClient.Builder<?> httpClientBuilder, URI endpoint) {
+        return create(builder, account, "test", region, httpClientBuilder, endpoint);
+    }
+
+    private static <B extends AwsClientBuilder<B, C> & AwsSyncClientBuilder<B, C>, C> C create(
+            B builder, String accessKey, String secretKey, Region region,
+            SdkHttpClient.Builder<?> httpClientBuilder, URI endpoint) {
+        return builder.endpointOverride(endpoint)
+                .httpClientBuilder(httpClientBuilder).region(region)
+                .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(accessKey, secretKey)))
                 .build();
     }
 }

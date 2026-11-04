@@ -25,6 +25,9 @@
 # by tools/aws/regen_ecs_shapes.py.
 # src/main/resources/aws/ecr-request-shapes.json, the ECR request constraints, is generated
 # from botocore's ECR model by tools/aws/regen_ecr_shapes.py.
+# src/main/resources/aws/payment-cryptography-request-shapes.json, the Payment Cryptography
+# request constraints, is generated from botocore's model by
+# tools/aws/regen_payment_cryptography_shapes.py.
 # src/main/resources/aws/rds-ca-certificates.json, each Region's RDS certificate authorities, is
 # generated from the certificate bundles AWS publishes by tools/aws/regen_rds_ca_certificates.py.
 # src/main/resources/aws/iam-request-shapes.json, the IAM request constraints of the operations
@@ -34,8 +37,10 @@
 # src/main/resources/aws/emr-serverless-shapes.json, the shapes the Step Functions emr-serverless
 # integrations recase against, is generated from botocore's EMR Serverless model by
 # tools/aws/regen_emr_serverless_shapes.py.
-# src/test/resources/aws/rest-routes.json, the REST routes IamRestRouteCoverageTest checks, is
-# generated from botocore's models by tools/aws/regen_rest_routes.py.
+# src/main/resources/aws/rest-routes.json, the REST routes IamActionRegistry checks a request no rule
+# maps by, and IamRestRouteCoverageTest checks the rules against, is generated from botocore's models
+# by tools/aws/regen_rest_routes.py. A model it adds also needs make iam-authorized-actions-sync, whose
+# check fails until the actions of no resource type list the model's scope.
 # src/main/resources/aws/iam-paginators.json, what each paged IAM list pages by, is generated
 # from botocore's IAM model and paginators by tools/aws/regen_iam_paginators.py.
 
@@ -68,12 +73,13 @@ PREFIX ?= $(HOME)/.local
 .DEFAULT_GOAL := help
 .PHONY: help dev build test native native-host run-native native-install native-image native-up native-down native-logs clean-sidecars clean-volumes compat docker-tests \
         docs-sync docs-check docs-test partition-check partition-baseline partition-audit partition-test rename-test \
-        slr-check slr-table slr-audit slr-test \
-        aws-data-sync aws-data-check aws-data-test \
+        slr-check slr-table slr-audit slr-test snapshot-mine snapshot-mine-test \
+        aws-data-sync aws-data-sync-botocore aws-data-check aws-data-check-botocore aws-data-test botocore-bump eks-addons-sync \
         iam-namespaces-sync iam-namespaces-check iam-namespaces-verify iam-namespaces-test \
         iam-action-resources-sync iam-action-resources-check iam-action-resources-verify \
         iam-action-resources-test iam-authorized-actions-sync iam-authorized-actions-check \
         cfn-property-types-sync cfn-property-types-check cfn-property-types-verify cfn-property-types-test \
+        cfn-schema-surface-sync cfn-schema-surface-verify cfn-schema-surface-test \
         iam-authorized-actions-verify iam-authorized-actions-test iam-passed-roles-sync iam-passed-roles-check \
         iam-passed-roles-verify iam-passed-roles-test iam-passed-network-connectors-sync \
         iam-passed-network-connectors-check iam-passed-network-connectors-verify \
@@ -233,14 +239,44 @@ slr-audit: ## Print the service-linked role table, marking names that are not de
 slr-test: ## Run the service-linked role tooling's unit tests
 	$(PYTHON) -m pytest tools/slr -q
 
+snapshot-mine: ## Print the answers a LocalStack checkout's AWS-validated snapshots carry (LOCALSTACK=<checkout>)
+	@test -n "$(LOCALSTACK)" || { \
+		echo "error: set LOCALSTACK to a LocalStack checkout, which this repository does not vendor"; \
+		echo "       git clone --depth 1 https://github.com/localstack/localstack ../localstack"; \
+		exit 1; \
+	}
+	$(PYTHON) tools/aws-capture/localstack/mine_snapshot_messages.py --localstack "$(LOCALSTACK)" $(MINE_ARGS)
+
+snapshot-mine-test: ## Run the snapshot miner's unit tests
+	$(PYTHON) -m pytest tools/aws-capture/localstack -q
+
+botocore-bump: ## Bump the botocore pin to VERSION, move local/aws/botocore to that tag and regenerate the botocore-derived AWS data
+	@test -n "$(VERSION)" || { echo "usage: make botocore-bump VERSION=<botocore release, e.g. 1.43.118>"; exit 2; }
+	@test -d local/aws/botocore/.git || { echo "error: local/aws/botocore is not checked out"; exit 1; }
+	@test -z "$$(git -C local/aws/botocore status --porcelain)" || { echo "error: local/aws/botocore has local changes"; exit 1; }
+	git -C local/aws/botocore fetch --depth 1 --no-tags origin "refs/tags/$(VERSION)"
+	git -C local/aws/botocore switch --detach --quiet FETCH_HEAD
+	@grep -q "__version__ = '$(VERSION)'" local/aws/botocore/botocore/__init__.py || { \
+		echo "error: local/aws/botocore at refs/tags/$(VERSION) does not report version $(VERSION)"; exit 1; }
+	sed -i.bak 's/^botocore==.*/botocore==$(VERSION)/' tools/aws/requirements.txt && rm tools/aws/requirements.txt.bak
+	$(MAKE) --no-print-directory aws-data-sync-botocore
+	$(MAKE) --no-print-directory aws-data-check-botocore
+
 aws-data-sync: ## Regenerate src/main/resources/aws/*.json and the IAM managed-policy catalog from local/aws (commit the result)
 	$(PYTHON) tools/aws/regen_partitions.py
+	$(MAKE) --no-print-directory aws-data-sync-botocore
 	$(PYTHON) tools/aws/regen_region_facts.py
 	$(PYTHON) tools/aws/regen_rds_ca_certificates.py
+	$(PYTHON) tools/aws/regen_managed_policies.py
+
+aws-data-sync-botocore: ## Regenerate only the AWS data derived from botocore, so a bump picks up nothing from the other local/aws sources
+	$(PYTHON) tools/aws/regen_partitions.py --carry-region-flags
 	$(PYTHON) tools/aws/regen_dynamodb_shapes.py
 	$(PYTHON) tools/aws/regen_redshift_serverless_shapes.py
 	$(PYTHON) tools/aws/regen_resource_groups_shapes.py
+	$(PYTHON) tools/aws/regen_logs_delivery_shapes.py
 	$(PYTHON) tools/aws/regen_ecr_shapes.py
+	$(PYTHON) tools/aws/regen_payment_cryptography_shapes.py
 	$(PYTHON) tools/aws/regen_iam_shapes.py
 	$(PYTHON) tools/aws/regen_sts_shapes.py
 	$(PYTHON) tools/aws/regen_apigateway_types.py
@@ -251,9 +287,8 @@ aws-data-sync: ## Regenerate src/main/resources/aws/*.json and the IAM managed-p
 	$(PYTHON) tools/aws/regen_query_services.py
 	$(PYTHON) tools/aws/regen_rest_routes.py
 	$(PYTHON) tools/aws/regen_iam_paginators.py
-	$(PYTHON) tools/aws/regen_managed_policies.py
 
-aws-data-check: ## CI gate: the vendored AWS data must match a fresh generation
+aws-data-check: aws-data-check-botocore ## CI gate: the vendored AWS data must match a fresh generation
 	@$(PYTHON) tools/aws/regen_partitions.py --check || { \
 		echo ""; \
 		echo "error: src/main/resources/aws/partitions.json is out of date."; \
@@ -270,6 +305,26 @@ aws-data-check: ## CI gate: the vendored AWS data must match a fresh generation
 		echo ""; \
 		echo "error: src/main/resources/aws/rds-ca-certificates.json is out of date or malformed."; \
 		echo "       Run 'tools/aws/regen_rds_ca_certificates.py --download', then 'make aws-data-sync', and commit the result."; \
+		exit 1; \
+	}
+	@$(PYTHON) tools/aws/regen_managed_policies.py --check || { \
+		echo ""; \
+		echo "error: the IAM managed-policy catalog (src/main/resources/iam/managed-polic*) is out of date or malformed."; \
+		echo "       Run 'make aws-data-sync' with local/aws checked out and commit the result."; \
+		exit 1; \
+	}
+	@$(PYTHON) tools/aws/regen_eks_addon_versions.py --check || { \
+		echo ""; \
+		echo "error: src/main/resources/eks/addon-versions.json is malformed or misses an add-on or Kubernetes version."; \
+		echo "       Run 'make eks-addons-sync' and commit the result."; \
+		exit 1; \
+	}
+
+aws-data-check-botocore: ## The AWS data derived from botocore must match a fresh generation
+	@$(PYTHON) tools/aws/regen_partitions.py --check --carry-region-flags || { \
+		echo ""; \
+		echo "error: src/main/resources/aws/partitions.json is out of date."; \
+		echo "       Run 'make aws-data-sync' and commit the result."; \
 		exit 1; \
 	}
 	@$(PYTHON) tools/aws/regen_dynamodb_shapes.py --check || { \
@@ -300,9 +355,19 @@ aws-data-check: ## CI gate: the vendored AWS data must match a fresh generation
 		echo "error: Resource Groups request shapes are out of date; run 'make aws-data-sync'."; \
 		exit 1; \
 	}
+	@$(PYTHON) tools/aws/regen_logs_delivery_shapes.py --check || { \
+		echo "error: Logs delivery request shapes are out of date; run 'make aws-data-sync'."; \
+		exit 1; \
+	}
 	@$(PYTHON) tools/aws/regen_ecr_shapes.py --check || { \
 		echo ""; \
 		echo "error: src/main/resources/aws/ecr-request-shapes.json is out of date."; \
+		echo "       Run 'make aws-data-sync' and commit the result."; \
+		exit 1; \
+	}
+	@$(PYTHON) tools/aws/regen_payment_cryptography_shapes.py --check || { \
+		echo ""; \
+		echo "error: src/main/resources/aws/payment-cryptography-request-shapes.json is out of date."; \
 		echo "       Run 'make aws-data-sync' and commit the result."; \
 		exit 1; \
 	}
@@ -342,7 +407,7 @@ aws-data-check: ## CI gate: the vendored AWS data must match a fresh generation
 	}
 	@$(PYTHON) tools/aws/regen_rest_routes.py --check || { \
 		echo ""; \
-		echo "error: src/test/resources/aws/rest-routes.json is out of date."; \
+		echo "error: src/main/resources/aws/rest-routes.json is out of date."; \
 		echo "       Run 'make aws-data-sync' and commit the result."; \
 		exit 1; \
 	}
@@ -352,16 +417,13 @@ aws-data-check: ## CI gate: the vendored AWS data must match a fresh generation
 		echo "       Run 'make aws-data-sync' and commit the result."; \
 		exit 1; \
 	}
-	@$(PYTHON) tools/aws/regen_managed_policies.py --check || { \
-		echo ""; \
-		echo "error: the IAM managed-policy catalog (src/main/resources/iam/managed-polic*) is out of date or malformed."; \
-		echo "       Run 'make aws-data-sync' with local/aws checked out and commit the result."; \
-		exit 1; \
-	}
 	@$(MAKE) --no-print-directory iam-passed-roles-check
 	@$(MAKE) --no-print-directory iam-passed-network-connectors-check
 	@$(MAKE) --no-print-directory iam-tag-on-create-check
 	@$(MAKE) --no-print-directory iam-request-resources-check
+
+eks-addons-sync: ## Regenerate src/main/resources/eks/addon-versions.json from EKS (needs AWS credentials; commit the result)
+	$(PYTHON) tools/aws/regen_eks_addon_versions.py
 
 aws-data-test: ## Run the AWS data generators' unit tests
 	$(PYTHON) -m pytest tools/aws -q
@@ -429,7 +491,8 @@ IAM_NAMESPACES_PATHS := src/main/resources/aws/iam-service-namespaces.json \
 IAM_ACTION_RESOURCES_PATHS := src/main/resources/aws/iam-action-resources.json \
 	tools/aws/regen_iam_action_resources.py tools/aws/test_regen_iam_action_resources.py
 IAM_AUTHORIZED_ACTIONS_PATHS := src/main/resources/aws/iam-authorized-actions.json \
-	tools/aws/regen_iam_authorized_actions.py tools/aws/test_regen_iam_authorized_actions.py
+	tools/aws/regen_iam_authorized_actions.py tools/aws/test_regen_iam_authorized_actions.py \
+	src/main/resources/aws/rest-routes.json
 IAM_PASSED_ROLES_PATHS := src/main/resources/aws/iam-passed-roles.json $(IAM_PASSED_ROLES_GENERATOR) \
 	tools/aws/test_regen_iam_passed_roles.py
 IAM_PASSED_NETWORK_CONNECTORS_PATHS := src/main/resources/aws/iam-passed-network-connectors.json \
@@ -696,6 +759,25 @@ cfn-property-types-verify: ## CI gate (online): the vendored CloudFormation prop
 
 cfn-property-types-test: ## Run the CloudFormation property type generator's unit tests
 	$(PYTHON) -m pytest tools/aws/test_regen_cfn_property_types.py -q
+
+cfn-schema-surface-sync: ## Regenerate src/test/resources/cloudformation/schema-surface.tsv from AWS's resource schemas (commit the result)
+	$(PYTHON) tools/aws/regen_cfn_schema_surface.py
+
+cfn-schema-surface-verify: ## CI gate (online): the committed CloudFormation schema surface must still match AWS's schemas
+	@$(PYTHON) tools/aws/regen_cfn_schema_surface.py --verify; status=$$?; \
+	if [ $$status -eq 2 ]; then \
+		echo ""; \
+		echo "error: could not read AWS's CloudFormation resource schemas, so nothing was verified."; \
+		exit 1; \
+	elif [ $$status -ne 0 ]; then \
+		echo ""; \
+		echo "error: AWS has changed a resource schema the CloudFormation schema surface comes from."; \
+		echo "       Run 'make cfn-schema-surface-sync' and commit the result."; \
+		exit 1; \
+	fi
+
+cfn-schema-surface-test: ## Run the CloudFormation schema surface generator's unit tests
+	$(PYTHON) -m pytest tools/aws/test_regen_cfn_schema_surface.py -q
 
 .PHONY: dynamodb-condition-keys-sync dynamodb-condition-keys-check dynamodb-condition-keys-verify
 dynamodb-condition-keys-sync: ## Regenerate DynamoDB IAM condition keys from AWS and botocore

@@ -25,6 +25,7 @@ import io.github.hectorvent.floci.services.emrserverless.model.JobRunRecord;
 import io.github.hectorvent.floci.services.emrserverless.model.JobRunSummary;
 import io.github.hectorvent.floci.services.emrserverless.model.RuntimeConfiguration;
 import io.github.hectorvent.floci.services.emrserverless.model.StartJobRunRequest;
+import io.github.hectorvent.floci.services.emrserverless.model.WorkerTypeSpecification;
 import io.github.hectorvent.floci.services.iam.IamService;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -38,6 +39,7 @@ import java.time.OffsetDateTime;
 import java.time.format.DateTimeParseException;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -89,8 +91,25 @@ public class EmrServerlessJobRunService implements Resettable {
     // "If you don't specify the optional values, then CloudWatch publishes the logs to a default log group".
     private static final String DEFAULT_LOG_GROUP = "/aws/emr-serverless";
     private static final String SPARK_DRIVER = "SPARK_DRIVER";
+    private static final String HIVE_DRIVER = "HIVE_DRIVER";
+    private static final String HIVE_TYPE = "HIVE";
+    // The classifications a Hive run's settings come from, "Hadoop's core-site.xml", "Tez's tez-site.xml" and "Hive's
+    // hive-site.xml", in the order Hive loads the files, a later one winning. emrfs-site sets EMRFS, which Floci's
+    // S3A replaces.
+    private static final List<String> HIVE_CLASSIFICATIONS = List.of("core-site", "tez-site", "hive-site");
+    // The worker types a Spark application's driver and a Hive application's run as.
+    private static final String DRIVER_WORKER_TYPE = "Driver";
+    private static final String HIVE_DRIVER_WORKER_TYPE = "HiveDriver";
+    // spark-submit's option for a Spark property, and its short form; and its option for spark.archives.
+    private static final String CONF_OPTION = "--conf";
+    private static final String CONF_SHORT_OPTION = "-c";
+    private static final String ARCHIVES_OPTION = "--archives";
+    // "Option that adds environment variables to the Spark driver."
+    private static final String DRIVER_ENV_PREFIX = "spark.emr-serverless.driverEnv.";
+    private static final String SPARK_ARCHIVES = "spark.archives";
     // No source gives AWS's wording for these; they are Floci's.
-    static final String HIVE_NOT_RUN = "Floci runs Spark job runs only, and this is a Hive job run.";
+    static final String DRIVER_NOT_THE_APPLICATIONS = "Floci runs a Spark application's sparkSubmit job runs and a"
+            + " Hive application's hive job runs, and this job run's driver is not its application's type.";
     static final String INTERRUPTED = "Floci stopped while the job run was in progress.";
 
     private static final Set<String> TERMINAL_STATES = Set.of(STATE_SUCCESS, STATE_FAILED, STATE_CANCELLED);
@@ -137,9 +156,10 @@ public class EmrServerlessJobRunService implements Resettable {
     // Null in the immediate runner mode.
     private final SparkJobRunner sparkRunner;
     private final Executor runExecutor;
-    // Where a container run's driver runs: image-template, with the release label for %s, and docker-network;
-    // null when not set.
+    // Where a container run's driver runs: image-template for a Spark run and hive-image-template for a Hive one,
+    // with the release label for %s, and docker-network; null when not set.
     private final String imageTemplate;
+    private final String hiveImageTemplate;
     private final String dockerNetwork;
     // Container runs a thread is running; one not here that has not ended was left by a restart.
     private final Set<String> executing = new HashSet<>();
@@ -157,6 +177,7 @@ public class EmrServerlessJobRunService implements Resettable {
                 RUNNER_DOCKER.equalsIgnoreCase(config.services().emrserverless().runnerMode()) ? sparkRunner : null,
                 Executors.newCachedThreadPool(Thread.ofPlatform().daemon().name("emr-serverless-run-", 0).factory()),
                 config.services().emrserverless().imageTemplate().orElse(null),
+                config.services().emrserverless().hiveImageTemplate().orElse(null),
                 config.services().emrserverless().dockerNetwork().orElse(null));
         // Before any run of this process starts: a driver an earlier one left belongs to a run read as FAILED.
         if (this.sparkRunner != null && config.services().emrserverless().reconcileContainersOnStartup()) {
@@ -176,15 +197,14 @@ public class EmrServerlessJobRunService implements Resettable {
                                ObjectMapper objectMapper, int runDurationSeconds, Clock clock,
                                SparkJobRunner sparkRunner, Executor runExecutor) {
         this(store, applications, iamService, regionResolver, requestContext, objectMapper, runDurationSeconds, clock,
-                sparkRunner, runExecutor, null, null);
+                sparkRunner, runExecutor, null, null, null);
     }
 
-    private EmrServerlessJobRunService(AccountAwareStorageBackend<JobRunRecord> store,
-                                       EmrServerlessService applications, IamService iamService,
-                                       RegionResolver regionResolver, RequestContext requestContext,
-                                       ObjectMapper objectMapper, int runDurationSeconds, Clock clock,
-                                       SparkJobRunner sparkRunner, Executor runExecutor,
-                                       String imageTemplate, String dockerNetwork) {
+    EmrServerlessJobRunService(AccountAwareStorageBackend<JobRunRecord> store, EmrServerlessService applications,
+                               IamService iamService, RegionResolver regionResolver, RequestContext requestContext,
+                               ObjectMapper objectMapper, int runDurationSeconds, Clock clock,
+                               SparkJobRunner sparkRunner, Executor runExecutor,
+                               String imageTemplate, String hiveImageTemplate, String dockerNetwork) {
         if (runDurationSeconds < 0) {
             throw new IllegalArgumentException(
                     "floci.services.emrserverless.job-run-duration-seconds must not be negative: " + runDurationSeconds);
@@ -200,6 +220,7 @@ public class EmrServerlessJobRunService implements Resettable {
         this.sparkRunner = sparkRunner;
         this.runExecutor = runExecutor;
         this.imageTemplate = imageTemplate;
+        this.hiveImageTemplate = hiveImageTemplate;
         this.dockerNetwork = dockerNetwork;
     }
 
@@ -464,11 +485,17 @@ public class EmrServerlessJobRunService implements Resettable {
         return record;
     }
 
-    /** Hands a container run to a thread of its own, which runs it to its end. */
+    /**
+     * Hands a container run to a thread of its own, which runs it to its end. A run whose driver is not its
+     * application's type, a {@code hive} one on a Spark application or a {@code sparkSubmit} one on a Hive
+     * application, fails without running: AWS documents no answer for one, and its application's image could
+     * not run it.
+     */
     private void launch(JobRunRecord record, Application app) {
         JobRun run = record.getJobRun();
-        if (run.getJobDriver().getSparkSubmit() == null) {
-            run.setStateDetails(HIVE_NOT_RUN);
+        JobDriver.Hive hive = run.getJobDriver().getHive();
+        if ((hive != null) != HIVE_TYPE.equalsIgnoreCase(app.getType())) {
+            run.setStateDetails(DRIVER_NOT_THE_APPLICATIONS);
             finish(record, STATE_FAILED, run.getCreatedAt());
             return;
         }
@@ -477,10 +504,23 @@ public class EmrServerlessJobRunService implements Resettable {
         Long minutes = run.getExecutionTimeoutMinutes();
         Duration timeout = MODE_STREAMING.equals(run.getMode()) || minutes == null || minutes == 0
                 ? Duration.ZERO : Duration.ofMinutes(minutes);
-        SparkJobRunner.Job job = new SparkJobRunner.Job(SERVICE, run.getJobRunId(), arn.accountId(), arn.region(),
-                run.getReleaseLabel(), imageTemplate, dockerNetwork, run.getExecutionRole(), sparkDefaults(app, run),
-                application(run.getJobDriver().getSparkSubmit()), null, timeout, driverLogFolder(app, run),
-                driverCloudWatchLogs(app, run));
+        SparkJobRunner.Job job;
+        if (hive != null) {
+            job = new SparkJobRunner.Job(SERVICE, run.getJobRunId(), arn.accountId(), arn.region(),
+                    run.getReleaseLabel(), SparkJobRunner.Engine.HIVE, hiveImageTemplate, customImage(app),
+                    dockerNetwork, run.getExecutionRole(), Map.of(), hiveArguments(app, run, hive), null, timeout,
+                    driverLogFolder(app, run), driverCloudWatchLogs(app, run), Map.of(), List.of(), null, Map.of(),
+                    Map.of(), Map.of(), Map.of(), Map.of());
+        } else {
+            JobDriver.SparkSubmit sparkSubmit = run.getJobDriver().getSparkSubmit();
+            Map<String, String> sparkDefaults = sparkDefaults(app, run);
+            Map<String, String> sparkProperties = sparkProperties(sparkDefaults, sparkSubmit);
+            job = new SparkJobRunner.Job(SERVICE, run.getJobRunId(), arn.accountId(), arn.region(),
+                    run.getReleaseLabel(), SparkJobRunner.Engine.SPARK, imageTemplate, customImage(app),
+                    dockerNetwork, run.getExecutionRole(), sparkDefaults, application(sparkSubmit), null, timeout,
+                    driverLogFolder(app, run), driverCloudWatchLogs(app, run), driverEnvironment(sparkProperties),
+                    archives(sparkProperties), null, Map.of(), Map.of(), Map.of(), Map.of(), Map.of());
+        }
         executing.add(run.getJobRunId());
         long launchedIn = generation;
         runExecutor.execute(() -> execute(job, launchedIn));
@@ -499,6 +539,23 @@ public class EmrServerlessJobRunService implements Resettable {
     }
 
     /**
+     * The custom image a run's driver starts from, or null for the release's: its driver's worker type's,
+     * {@code Driver} for a Spark application and {@code HiveDriver} for a Hive one, else the application's, which
+     * "EMR Serverless applies ... to all worker types". Local mode runs Spark's executors and Tez's tasks in the
+     * driver's container, so an {@code Executor} or {@code TezTask} image is not used.
+     */
+    static String customImage(Application app) {
+        String workerType = HIVE_TYPE.equalsIgnoreCase(app.getType()) ? HIVE_DRIVER_WORKER_TYPE : DRIVER_WORKER_TYPE;
+        WorkerTypeSpecification driver = app.getWorkerTypeSpecifications() != null
+                ? app.getWorkerTypeSpecifications().get(workerType) : null;
+        if (driver != null && driver.getImageConfiguration() != null
+                && driver.getImageConfiguration().getImageUri() != null) {
+            return driver.getImageConfiguration().getImageUri();
+        }
+        return app.getImageConfiguration() != null ? app.getImageConfiguration().getImageUri() : null;
+    }
+
+    /**
      * What follows Floci's own settings on a run's {@code spark-submit} command line: its
      * {@code sparkSubmitParameters}, split as a shell would split them, then its entry point and the
      * entry point's arguments.
@@ -511,6 +568,85 @@ public class EmrServerlessJobRunService implements Resettable {
             application.addAll(sparkSubmit.getEntryPointArguments());
         }
         return application;
+    }
+
+    /**
+     * What follows Floci's own settings on a Hive run's {@code hive} command line, in the user guide's order, a later
+     * setting winning: its {@code core-site}, {@code tez-site} and {@code hive-site} properties, each a
+     * {@code --hiveconf}, then its {@code initQueryFile} and {@code query}, which Hive runs in that order, then its
+     * {@code parameters}, split as a shell would split them, whose {@code --hiveconf} settings "take priority".
+     */
+    static List<String> hiveArguments(Application app, JobRun run, JobDriver.Hive hive) {
+        List<String> arguments = new ArrayList<>();
+        for (String classification : HIVE_CLASSIFICATIONS) {
+            arguments.addAll(EmrServerlessSparkRunner.hiveSettings(classificationProperties(app, run, classification)));
+        }
+        if (hive.getInitQueryFile() != null) {
+            arguments.add("-i");
+            arguments.add(hive.getInitQueryFile());
+        }
+        arguments.add("-f");
+        arguments.add(hive.getQuery());
+        arguments.addAll(EmrServerlessSparkRunner.splitParameters(hive.getParameters()));
+        return arguments;
+    }
+
+    /**
+     * A run's Spark properties as its driver gets them: its {@code spark-defaults}, then the {@code --conf}
+     * settings of its {@code sparkSubmitParameters}, which {@code spark-submit} lets win, a later one over an
+     * earlier. A setting without an {@code =}, which {@code spark-submit} refuses, sets nothing. The last
+     * {@code --archives} option is {@code spark.archives}, winning over any setting of it, as
+     * {@code spark-submit} has it.
+     */
+    static Map<String, String> sparkProperties(Map<String, String> sparkDefaults, JobDriver.SparkSubmit sparkSubmit) {
+        Map<String, String> properties = new LinkedHashMap<>(sparkDefaults);
+        List<String> parameters = EmrServerlessSparkRunner.splitParameters(sparkSubmit.getSparkSubmitParameters());
+        String archivesOption = null;
+        for (int i = 0; i < parameters.size(); i++) {
+            String parameter = parameters.get(i);
+            String setting = null;
+            if (parameter.startsWith(CONF_OPTION + "=")) {
+                setting = parameter.substring(CONF_OPTION.length() + 1);
+            } else if ((CONF_OPTION.equals(parameter) || CONF_SHORT_OPTION.equals(parameter))
+                    && i + 1 < parameters.size()) {
+                setting = parameters.get(++i);
+            } else if (parameter.startsWith(ARCHIVES_OPTION + "=")) {
+                archivesOption = parameter.substring(ARCHIVES_OPTION.length() + 1);
+            } else if (ARCHIVES_OPTION.equals(parameter) && i + 1 < parameters.size()) {
+                archivesOption = parameters.get(++i);
+            }
+            int equals = setting != null ? setting.indexOf('=') : -1;
+            if (equals > 0) {
+                properties.put(setting.substring(0, equals), setting.substring(equals + 1));
+            }
+        }
+        if (archivesOption != null) {
+            properties.put(SPARK_ARCHIVES, archivesOption);
+        }
+        return properties;
+    }
+
+    /** The environment variables a run's driver gets: its {@code spark.emr-serverless.driverEnv.<KEY>} properties. */
+    static Map<String, String> driverEnvironment(Map<String, String> sparkProperties) {
+        Map<String, String> environment = new LinkedHashMap<>();
+        sparkProperties.forEach((key, value) -> {
+            if (key.startsWith(DRIVER_ENV_PREFIX) && key.length() > DRIVER_ENV_PREFIX.length()) {
+                environment.put(key.substring(DRIVER_ENV_PREFIX.length()), value);
+            }
+        });
+        return environment;
+    }
+
+    /**
+     * A run's {@code spark.archives}: a comma-separated list, of which Spark takes each entry trimmed and drops
+     * the empty ones.
+     */
+    static List<String> archives(Map<String, String> sparkProperties) {
+        String archives = sparkProperties.get(SPARK_ARCHIVES);
+        if (archives == null) {
+            return List.of();
+        }
+        return Arrays.stream(archives.split(",")).map(String::trim).filter(archive -> !archive.isEmpty()).toList();
     }
 
     /**
@@ -663,17 +799,22 @@ public class EmrServerlessJobRunService implements Resettable {
         launch(record, app);
     }
 
+    /** The {@code spark-defaults} properties for a run, as {@link #classificationProperties} merges them. */
+    private static Map<String, String> sparkDefaults(Application app, JobRun run) {
+        return classificationProperties(app, run, SPARK_DEFAULTS);
+    }
+
     /**
-     * The {@code spark-defaults} properties for a run: the application's runtime configuration, then the
+     * A {@code classification}'s properties for a run: the application's runtime configuration, then the
      * run's own {@code applicationConfiguration}. The two merge by classification, so a run's
-     * {@code spark-defaults} replaces the application's: "Only the properties included in StartJobRun is
+     * classification replaces the application's: "Only the properties included in StartJobRun is
      * considered for this classification." From emr-spark-8.1.0 they merge by property, the run's winning.
      */
-    private static Map<String, String> sparkDefaults(Application app, JobRun run) {
+    private static Map<String, String> classificationProperties(Application app, JobRun run, String classification) {
         Map<String, String> properties = new LinkedHashMap<>();
         if (app.getRuntimeConfiguration() != null) {
             for (RuntimeConfiguration configuration : app.getRuntimeConfiguration()) {
-                addSparkDefaults(properties, configuration.getMembers());
+                addProperties(properties, configuration.getMembers(), classification);
             }
         }
         Object overrides = run.getConfigurationOverrides() != null
@@ -682,12 +823,12 @@ public class EmrServerlessJobRunService implements Resettable {
             boolean replaces = !releaseAtLeast(SPARK_RUNTIME_RELEASE_LABEL, run.getReleaseLabel(), 8, 1);
             for (Object configuration : configurations) {
                 if (configuration instanceof Map<?, ?> members
-                        && SPARK_DEFAULTS.equals(members.get("classification"))) {
+                        && classification.equals(members.get("classification"))) {
                     if (replaces) {
                         properties.clear();
                         replaces = false;
                     }
-                    addSparkDefaults(properties, members);
+                    addProperties(properties, members, classification);
                 }
             }
         }
@@ -699,7 +840,8 @@ public class EmrServerlessJobRunService implements Resettable {
      * {@code s3MonitoringConfiguration} or else the application's, an empty one at the run removing it. Under
      * its {@code logUri} the user guide puts a run's logs at {@code /applications/<applicationId>/jobs/<jobId>},
      * with {@code /attempts/<attemptNumber>} after it for "all streaming jobs and any batch jobs that have retry
-     * enabled" from release 7.1.0, and the driver's in {@code SPARK_DRIVER/}.
+     * enabled" from release 7.1.0, and the driver's in {@code SPARK_DRIVER/}, or a Hive run's in
+     * {@code HIVE_DRIVER/}: "EMR Serverless continuously uploads the Hive driver to the HIVE_DRIVER folder".
      */
     static String driverLogFolder(Application app, JobRun run) {
         String logUri = monitoring(app, run, S3_MONITORING) instanceof Map<?, ?> configuration
@@ -715,7 +857,8 @@ public class EmrServerlessJobRunService implements Resettable {
      * {@code logStreamNamePrefix}, with the attempt as for S3, and "By default, EMR Serverless publishes only
      * the driver stdout and stderr logs". Each goes to a stream of its own under the driver's, as the
      * clients that read them (Dagster's EMR Serverless client) name them: {@code .../SPARK_DRIVER/stdout}
-     * and {@code .../SPARK_DRIVER/stderr}. A {@code logTypes} that names some types takes only those of the
+     * and {@code .../SPARK_DRIVER/stderr}, {@code HIVE_DRIVER} for a Hive run, the worker type {@code logTypes}
+     * names its driver by. A {@code logTypes} that names some types takes only those of the
      * driver's it names, none when it names only other workers': "The types of logs that you want to publish
      * to CloudWatch. If you don't specify any log types, driver STDOUT and STDERR logs will be published".
      */
@@ -729,14 +872,14 @@ public class EmrServerlessJobRunService implements Resettable {
         String driver = prefix + driverLogPath(run) + "/";
         List<?> driverTypes = null;
         if (configuration.get("logTypes") instanceof Map<?, ?> logTypes && !logTypes.isEmpty()) {
-            driverTypes = logTypes.get(SPARK_DRIVER) instanceof List<?> types ? types : List.of();
+            driverTypes = logTypes.get(driverWorkerType(run)) instanceof List<?> types ? types : List.of();
         }
         String stdout = publishes(driverTypes, "stdout") ? driver + "stdout" : null;
         String stderr = publishes(driverTypes, "stderr") ? driver + "stderr" : null;
         return stdout == null && stderr == null ? null : new SparkJobRunner.CloudWatchLogs(logGroup, stdout, stderr);
     }
 
-    // Whether the driver's log types, as logTypes lists them for SPARK_DRIVER, take this one; both without a list.
+    // Whether the driver's log types, as logTypes lists them for its worker type, take this one; both without a list.
     private static boolean publishes(List<?> driverTypes, String logType) {
         return driverTypes == null
                 || driverTypes.stream().anyMatch(type -> logType.equalsIgnoreCase(String.valueOf(type)));
@@ -761,7 +904,12 @@ public class EmrServerlessJobRunService implements Resettable {
     private static String driverLogPath(JobRun run) {
         String attempts = retried(run) && retriesAttempts(run.getReleaseLabel()) ? "/attempts/" + run.getAttempt() : "";
         return "/applications/" + run.getApplicationId() + "/jobs/" + run.getJobRunId() + attempts + "/"
-                + SPARK_DRIVER;
+                + driverWorkerType(run);
+    }
+
+    // The worker type a run's driver logs as: HIVE_DRIVER for a Hive run, SPARK_DRIVER for a Spark one.
+    private static String driverWorkerType(JobRun run) {
+        return run.getJobDriver() != null && run.getJobDriver().getHive() != null ? HIVE_DRIVER : SPARK_DRIVER;
     }
 
     // A STREAMING run is retried, and a BATCH run whose retryPolicy allows more than one attempt.
@@ -775,8 +923,8 @@ public class EmrServerlessJobRunService implements Resettable {
                 || SPARK_RUNTIME_RELEASE_LABEL.matcher(releaseLabel != null ? releaseLabel : "").matches();
     }
 
-    private static void addSparkDefaults(Map<String, String> properties, Map<?, ?> configuration) {
-        if (SPARK_DEFAULTS.equals(configuration.get("classification"))
+    private static void addProperties(Map<String, String> properties, Map<?, ?> configuration, String classification) {
+        if (classification.equals(configuration.get("classification"))
                 && configuration.get("properties") instanceof Map<?, ?> values) {
             values.forEach((key, value) -> properties.put(String.valueOf(key), String.valueOf(value)));
         }

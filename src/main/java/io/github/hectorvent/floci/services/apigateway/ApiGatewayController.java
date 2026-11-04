@@ -2278,12 +2278,10 @@ public class ApiGatewayController {
             service.findRootResourceId(region, api.getId()).ifPresent(id -> node.put("rootResourceId", id));
         }
 
-        // Neither member is settable on a REST API here: createRestApi ignores both and
-        // updateRestApi patches only /name and /description, so the emulated value is always
-        // the AWS default. Report the defaults rather than omitting them, because a client
-        // that reads an absent member back as "" or null sees it as a difference from the
-        // configuration it just sent and never converges.
-        node.put("apiKeySource", "HEADER");
+        node.put("apiKeySource", api.getApiKeySource());
+        // Not settable on a REST API here, so the emulated value is always the AWS default.
+        // Report it rather than omitting it, because a client that reads an absent member back
+        // as null sees it as a difference from the configuration it just sent and never converges.
         node.put("disableExecuteApiEndpoint", false);
 
         // AWS returns the policy JSON-escaped inside the string ({\"Version\":...}), and the
@@ -2800,6 +2798,9 @@ public class ApiGatewayController {
         if (i.getConnectionType() != null) node.put("connectionType", i.getConnectionType());
         if (i.getConnectionId() != null) node.put("connectionId", i.getConnectionId());
         node.put("payloadFormatVersion", i.getPayloadFormatVersion());
+        if (i.getCredentialsArn() != null) {
+            node.put("credentialsArn", i.getCredentialsArn());
+        }
         if (i.getIntegrationUri() != null) node.put("integrationUri", i.getIntegrationUri());
         if (i.getRequestTemplates() != null) {
             ObjectNode requestTemplates = node.putObject("requestTemplates");
@@ -2932,6 +2933,9 @@ public class ApiGatewayController {
             if (a.getJwtConfiguration().issuer() != null) {
                 jwt.put("issuer", a.getJwtConfiguration().issuer());
             }
+        }
+        if (a.getAuthorizerCredentialsArn() != null) {
+            node.put("authorizerCredentialsArn", a.getAuthorizerCredentialsArn());
         }
         if (a.getAuthorizerUri() != null) {
             node.put("authorizerUri", a.getAuthorizerUri());

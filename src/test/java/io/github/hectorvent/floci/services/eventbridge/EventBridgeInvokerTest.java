@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.ServiceRegistry;
 import io.github.hectorvent.floci.services.batch.BatchService;
 import io.github.hectorvent.floci.services.ecs.EcsJsonHandler;
 import io.github.hectorvent.floci.services.ecs.EcsService;
@@ -23,6 +24,7 @@ import io.github.hectorvent.floci.services.firehose.model.Record;
 import io.github.hectorvent.floci.services.kinesis.KinesisService;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
+import io.github.hectorvent.floci.services.redshiftdata.RedshiftDataService;
 import io.github.hectorvent.floci.services.sns.SnsService;
 import io.github.hectorvent.floci.services.sqs.SqsService;
 import io.github.hectorvent.floci.services.stepfunctions.StepFunctionsService;
@@ -71,6 +73,8 @@ class EventBridgeInvokerTest {
         EmulatorConfig emulatorConfig =
                 mock(EmulatorConfig.class,
                         Mockito.RETURNS_DEEP_STUBS);
+        RedshiftDataService redshiftDataService = mock(RedshiftDataService.class);
+        ServiceRegistry serviceRegistry = mock(ServiceRegistry.class);
         invoker = new EventBridgeInvoker(
                 lambdaService,
                 sqsService,
@@ -83,6 +87,9 @@ class EventBridgeInvokerTest {
                 new EcsJsonHandler(ecsService, new ObjectMapper(),
                         new HostVolumePolicy(emulatorConfig)),
                 stepFunctionsService,
+                redshiftDataService,
+                null,
+                serviceRegistry,
                 regionResolver,
                 new ObjectMapper(),
                 emulatorConfig
@@ -441,6 +448,34 @@ class EventBridgeInvokerTest {
     void extractJsonPath_nonTextualValueReturnsRawJson() {
         String event = "{\"detail\":{\"size\":42}}";
         assertEquals("42", invoker.extractJsonPath("$.detail.size", event));
+    }
+
+    @Test
+    void indexedPathsAreSharedByInputPathAndInputTransformer() {
+        String event = "{\"detail\":{\"items\":[{\"name\":\"first\"},{\"name\":\"second\"}]}}";
+        assertEquals("second", invoker.applyInputPath("$.detail.items[1].name", event));
+
+        InputTransformer transformer = new InputTransformer();
+        transformer.setInputPathsMap(Map.of("name", "$.detail.items[0].name"));
+        transformer.setInputTemplate("{\"name\":<name>}");
+        assertEquals("{\"name\":\"first\"}", invoker.applyInputTransformer(transformer, event));
+        assertTrue(invoker.extractNode("$.detail.items[2]", event).isMissingNode());
+        assertEquals("value", invoker.extractNode("$[0][0]", "[[\"value\"]]").asText());
+    }
+
+    @Test
+    void escapedFieldNamesAreSharedByInputPathAndInputTransformer() {
+        String event = """
+                {"detail":{"sql/query":[{"name~1/query":"select 1"}],
+                  "name~/query":"select 2","name/query":"wrong"}}
+                """;
+        String path = "$.detail.sql/query[0].name~1/query";
+        assertEquals("select 1", invoker.applyInputPath(path, event));
+
+        InputTransformer transformer = new InputTransformer(
+                Map.of("sql", path), "{\"sql\":<sql>}");
+        assertEquals("{\"sql\":\"select 1\"}", invoker.applyInputTransformer(transformer, event));
+        assertEquals("select 2", invoker.extractJsonPath("$.detail.name~/query", event));
     }
 
     @Test

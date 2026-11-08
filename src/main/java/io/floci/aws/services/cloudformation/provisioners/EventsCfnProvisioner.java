@@ -16,6 +16,7 @@ import io.floci.aws.services.eventbridge.model.EcsParameters;
 import io.floci.aws.services.eventbridge.model.EventBus;
 import io.floci.aws.services.eventbridge.model.HttpParameters;
 import io.floci.aws.services.eventbridge.model.InputTransformer;
+import io.floci.aws.services.eventbridge.model.KinesisParameters;
 import io.floci.aws.services.eventbridge.model.Rule;
 import io.floci.aws.services.eventbridge.model.RuleState;
 import io.floci.aws.services.eventbridge.model.SqsParameters;
@@ -216,6 +217,7 @@ public class EventsCfnProvisioner implements CfnResourceProvisioner {
                     target.setSqsParameters(sqsParameters);
                 }
             }
+            target.setKinesisParameters(KinesisParameters.fromJson(resolved.path("KinesisParameters")));
             JsonNode batchParamsNode = resolved.path("BatchParameters");
             if (!batchParamsNode.isMissingNode() && batchParamsNode.isObject()) {
                 JsonNode arrayProperties = batchParamsNode.path("ArrayProperties");

@@ -221,7 +221,7 @@ class EventBridgeRedshiftDataTargetTest {
         when(config.baseUrl()).thenReturn("http://localhost:4566");
         EventBridgeInvoker scopedInvoker = new EventBridgeInvoker(
                 mock(LambdaService.class), mock(SqsService.class), mock(SnsService.class),
-                null, null, null, null, null, null,
+                null, null, null, null, null, null, null,
                 redshiftDataService, null, serviceRegistry, resolver, new ObjectMapper(), config);
 
         Target target = target(CLUSTER_ARN);

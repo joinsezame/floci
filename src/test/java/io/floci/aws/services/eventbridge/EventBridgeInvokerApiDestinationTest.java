@@ -197,8 +197,8 @@ class EventBridgeInvokerApiDestinationTest {
                 new ApiDestination("tls", DESTINATION_ARN, CONNECTION_ARN, endpoint, "POST", null, null));
         when(eventBridgeService.findConnectionByArn(CONNECTION_ARN, REGION)).thenReturn(new Connection());
         return new EventBridgeInvoker(mock(LambdaService.class), mock(SqsService.class), mock(SnsService.class),
-                null, null, eventBridgeService, null, null, null, null, null, null, null, new ObjectMapper(), config,
-                (AppSyncTargetInvoker) null);
+                null, null, null, eventBridgeService, null, null, null, null, null, null, null,
+                new ObjectMapper(), config, (AppSyncTargetInvoker) null);
     }
 
     private static Target apiDestinationTarget() {

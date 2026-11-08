@@ -20,6 +20,7 @@ import io.floci.aws.services.eventbridge.model.EcsParameters;
 import io.floci.aws.services.eventbridge.model.EventBus;
 import io.floci.aws.services.eventbridge.model.HttpParameters;
 import io.floci.aws.services.eventbridge.model.InputTransformer;
+import io.floci.aws.services.eventbridge.model.KinesisParameters;
 import io.floci.aws.services.eventbridge.model.RedshiftDataParameters;
 import io.floci.aws.services.eventbridge.model.Replay;
 import io.floci.aws.services.eventbridge.model.ReplayState;
@@ -278,6 +279,7 @@ public class EventBridgeHandler {
                         target.setSqsParameters(sqsParameters);
                     }
                 }
+                target.setKinesisParameters(KinesisParameters.fromJson(t.path("KinesisParameters")));
                 JsonNode batchParamsNode = t.path("BatchParameters");
                 if (!batchParamsNode.isMissingNode() && batchParamsNode.isObject()) {
                     target.setBatchParameters(objectMapper.convertValue(batchParamsNode, BatchParameters.class));
@@ -364,6 +366,10 @@ public class EventBridgeHandler {
             }
             if (t.getSqsParameters() != null && t.getSqsParameters().getMessageGroupId() != null) {
                 node.putObject("SqsParameters").put("MessageGroupId", t.getSqsParameters().getMessageGroupId());
+            }
+            if (t.getKinesisParameters() != null && t.getKinesisParameters().getPartitionKeyPath() != null) {
+                node.putObject("KinesisParameters")
+                        .put("PartitionKeyPath", t.getKinesisParameters().getPartitionKeyPath());
             }
             if (t.getBatchParameters() != null) {
                 node.set("BatchParameters", objectMapper.valueToTree(t.getBatchParameters()));

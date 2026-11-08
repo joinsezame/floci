@@ -136,6 +136,7 @@ public class EventBridgeInvoker {
                               SnsService snsService,
                               BatchService batchService,
                               FirehoseService firehoseService,
+                              KinesisService kinesisService,
                               EventBridgeService eventBridgeService,
                               EcsService ecsService,
                               EcsJsonHandler ecsJsonHandler,
@@ -146,7 +147,8 @@ public class EventBridgeInvoker {
                               RegionResolver regionResolver,
                               ObjectMapper objectMapper,
                               EmulatorConfig config) {
-        this(lambdaService, sqsService, snsService, batchService, firehoseService, eventBridgeService,
+        this(lambdaService, sqsService, snsService, batchService, firehoseService, kinesisService,
+                eventBridgeService,
                 ecsService, ecsJsonHandler, stepFunctionsService, redshiftDataService, redshiftTargetAuthorizer,
                 serviceRegistry, regionResolver, objectMapper, config, apiDestinationClient(null), null);
     }
@@ -156,6 +158,7 @@ public class EventBridgeInvoker {
                        SnsService snsService,
                        BatchService batchService,
                        FirehoseService firehoseService,
+                       KinesisService kinesisService,
                        EventBridgeService eventBridgeService,
                        EcsService ecsService,
                        EcsJsonHandler ecsJsonHandler,
@@ -167,21 +170,10 @@ public class EventBridgeInvoker {
                        ObjectMapper objectMapper,
                        EmulatorConfig config,
                        HttpClient httpClient) {
-        this(lambdaService, sqsService, snsService, batchService, firehoseService, eventBridgeService,
+        this(lambdaService, sqsService, snsService, batchService, firehoseService, kinesisService,
+                eventBridgeService,
                 ecsService, ecsJsonHandler, stepFunctionsService, redshiftDataService, redshiftTargetAuthorizer,
                 serviceRegistry, regionResolver, objectMapper, config, httpClient, null);
-    }
-
-    private EventBridgeInvoker(LambdaService lambdaService, SqsService sqsService, SnsService snsService,
-                               BatchService batchService, FirehoseService firehoseService,
-                               EventBridgeService eventBridgeService, EcsService ecsService,
-                               EcsJsonHandler ecsJsonHandler, StepFunctionsService stepFunctionsService,
-                               RedshiftDataService redshiftDataService, RedshiftTargetAuthorizer redshiftTargetAuthorizer,
-                               ServiceRegistry serviceRegistry, RegionResolver regionResolver, ObjectMapper objectMapper,
-                               EmulatorConfig config, HttpClient httpClient, AppSyncTargetInvoker appSyncTargetInvoker) {
-        this(lambdaService, sqsService, snsService, batchService, firehoseService, null, eventBridgeService,
-                ecsService, ecsJsonHandler, stepFunctionsService, redshiftDataService, redshiftTargetAuthorizer,
-                serviceRegistry, regionResolver, objectMapper, config, httpClient, appSyncTargetInvoker);
     }
 
     private EventBridgeInvoker(LambdaService lambdaService, SqsService sqsService, SnsService snsService,
@@ -218,7 +210,7 @@ public class EventBridgeInvoker {
                        ObjectMapper objectMapper,
                        EmulatorConfig config) {
         this(lambdaService, sqsService, snsService,
-                null /* batch */, null /* firehose */, null /* eventBridge */, null /* ecs */,
+                null /* batch */, null /* firehose */, null /* kinesis */, null /* eventBridge */, null /* ecs */,
                 null /* ecsJsonHandler */, null /* stepFunctions */, null /* redshiftData */,
                 null /* redshiftTargetAuthorizer */, null /* registry */,
                 null /* regionResolver */,
@@ -233,7 +225,7 @@ public class EventBridgeInvoker {
                        ObjectMapper objectMapper,
                        EmulatorConfig config) {
         this(lambdaService, sqsService, snsService,
-                null /* batch */, null /* firehose */, null /* eventBridge */, null /* ecs */,
+                null /* batch */, null /* firehose */, null /* kinesis */, null /* eventBridge */, null /* ecs */,
                 null /* ecsJsonHandler */, null /* stepFunctions */, redshiftDataService,
                 null /* redshiftTargetAuthorizer */, serviceRegistry,
                 null /* regionResolver */,
@@ -315,28 +307,8 @@ public class EventBridgeInvoker {
                     firehoseService.putRecord(streamArn.accountId(), streamArn.region(), streamName, record);
                 }
                 LOG.debugv("EventBridge delivered to Firehose: {0}", arn);
-            } else if (AwsArnUtils.isArnFor(arn, "kinesis")
-                    && AwsArnUtils.parse(arn).resource().startsWith("stream/")) {
-                if (kinesisService == null) {
-                    throw new AwsException("ServiceNotAvailableException", "Kinesis delivery is not available.", 400);
-                }
-                AwsArnUtils.Arn streamArn = AwsArnUtils.parse(arn);
-                String partitionKey;
-                if (target.getKinesisParameters() == null) {
-                    partitionKey = extractJsonPath("$.id", eventJson);
-                } else {
-                    JsonNode selected = extractNode(target.getKinesisParameters().partitionKeyPath(), eventJson);
-                    partitionKey = selected.isMissingNode() ? "{}" : selected.toString();
-                }
-                if (partitionKey == null || partitionKey.codePointCount(0, partitionKey.length()) < 1
-                        || partitionKey.codePointCount(0, partitionKey.length()) > 256) {
-                    throw new AwsException("InvalidParameterException",
-                            "EventBridge Kinesis partition key is missing or outside 1..256 characters.", 400);
-                }
-                String streamName = streamArn.resource().substring("stream/".length());
-                kinesisService.putRecordForAccount(streamArn.accountId(), streamName,
-                        payload.getBytes(StandardCharsets.UTF_8), partitionKey, streamArn.region());
-                LOG.debugv("EventBridge delivered to Kinesis: {0}", arn);
+            } else if (arn.contains(":kinesis:") && arn.contains(":stream/")) {
+                deliverToKinesis(target, arn, payload, eventJson, region);
             } else if (AwsArnUtils.isArnFor(arn, "redshift")
                     || AwsArnUtils.isArnFor(arn, "redshift-serverless")) {
                 deliverToRedshiftData(target, arn, eventJson, ruleArn);
@@ -539,6 +511,52 @@ public class EventBridgeInvoker {
                 new io.floci.aws.services.ecs.model.NetworkConfiguration();
         target.setAwsvpcConfiguration(targetVpc);
         return target;
+    }
+
+    /**
+     * A Kinesis target writes the input-transformed payload and takes its partition key from the
+     * original event. {@code TestingEventHub} sets {@code InputPath} to {@code $.detail} and
+     * {@code PartitionKeyPath} to {@code $.detail.id}; the path has to see {@code detail}.
+     */
+    private void deliverToKinesis(Target target, String arn, String payload, String eventJson, String region) {
+        if (kinesisService == null) {
+            LOG.warnv("EventBridge Kinesis target missing Kinesis service: {0}", arn);
+            return;
+        }
+        String partitionKey = kinesisPartitionKey(target, eventJson);
+        if (partitionKey == null) {
+            return;
+        }
+        AwsArnUtils.Arn streamArn = AwsArnUtils.parse(arn);
+        String streamName = streamArn.resource().substring("stream/".length());
+        int slash = streamName.indexOf('/');
+        if (slash >= 0) {
+            streamName = streamName.substring(0, slash);
+        }
+        byte[] data = payload.getBytes(StandardCharsets.UTF_8);
+        if (regionResolver == null || regionResolver.getRegion() == null) {
+            kinesisService.putRecord(streamName, data, partitionKey, region);
+        } else {
+            kinesisService.putRecordForAccount(
+                    streamArn.accountId(), streamName, data, partitionKey, streamArn.region());
+        }
+        LOG.debugv("EventBridge delivered to Kinesis: {0}", arn);
+    }
+
+    private String kinesisPartitionKey(Target target, String eventJson) {
+        Target.KinesisParameters parameters = target.getKinesisParameters();
+        String path = parameters == null ? null : parameters.partitionKeyPath();
+        if (path == null || path.isBlank()) {
+            LOG.warnv("EventBridge Kinesis target missing KinesisParameters.PartitionKeyPath: {0}", target.getArn());
+            return null;
+        }
+        String key = extractJsonPath(path, eventJson);
+        if (key == null || key.isBlank()) {
+            LOG.warnv("EventBridge Kinesis target partition key path {0} did not resolve on {1}",
+                    path, target.getArn());
+            return null;
+        }
+        return key;
     }
 
     String applyInputPath(String inputPath, String eventJson) {

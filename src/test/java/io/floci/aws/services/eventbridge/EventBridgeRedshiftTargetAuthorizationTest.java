@@ -57,7 +57,7 @@ class EventBridgeRedshiftTargetAuthorizationTest {
         EmulatorConfig config = mock(EmulatorConfig.class);
         when(config.baseUrl()).thenReturn("http://localhost:4566");
         invoker = new EventBridgeInvoker(mock(LambdaService.class), mock(SqsService.class), mock(SnsService.class),
-                null, null, null, null, null, null, redshiftDataService, authorizer, serviceRegistry, resolver,
+                null, null, null, null, null, null, null, redshiftDataService, authorizer, serviceRegistry, resolver,
                 new ObjectMapper(), config);
     }
 

@@ -20,6 +20,7 @@ import io.floci.aws.services.eventbridge.model.NetworkConfiguration;
 import io.floci.aws.services.eventbridge.model.Target;
 import io.floci.aws.services.firehose.FirehoseService;
 import io.floci.aws.services.firehose.model.Record;
+import io.floci.aws.services.kinesis.KinesisService;
 import io.floci.aws.services.lambda.LambdaService;
 import io.floci.aws.services.lambda.model.InvocationType;
 import io.floci.aws.services.redshiftdata.RedshiftDataService;
@@ -47,6 +48,7 @@ class EventBridgeInvokerTest {
     private SqsService sqsService;
     private BatchService batchService;
     private FirehoseService firehoseService;
+    private KinesisService kinesisService;
     private EventBridgeService eventBridgeService;
     private EcsService ecsService;
     private StepFunctionsService stepFunctionsService;
@@ -59,6 +61,7 @@ class EventBridgeInvokerTest {
         SnsService snsService = mock(SnsService.class);
         batchService = mock(BatchService.class);
         firehoseService = mock(FirehoseService.class);
+        kinesisService = mock(KinesisService.class);
         eventBridgeService = mock(EventBridgeService.class);
         ecsService = mock(EcsService.class);
         stepFunctionsService = mock(StepFunctionsService.class);
@@ -77,6 +80,7 @@ class EventBridgeInvokerTest {
                 snsService,
                 batchService,
                 firehoseService,
+                kinesisService,
                 eventBridgeService,
                 ecsService,
                 new EcsJsonHandler(ecsService, new ObjectMapper(),
@@ -392,6 +396,30 @@ class EventBridgeInvokerTest {
         verify(firehoseService).putRecord(eq("my-stream"), captor.capture());
         assertEquals("{\"custom\":\"payload\"}",
                 new String(captor.getValue().getData(), StandardCharsets.UTF_8));
+    }
+
+    @Test
+    void invokeTarget_kinesisTarget_usesOriginalEventForPartitionKeyAndTransformedBody() {
+        Target target = new Target("stream",
+                "arn:aws:kinesis:us-east-1:000000000000:stream/hub", null, "$.detail");
+        target.setKinesisParameters(new Target.KinesisParameters("$.detail.id"));
+        String event = "{\"detail\":{\"id\":\"evt-1\",\"type\":\"AuthorRegistered\"}}";
+
+        invoker.invokeTarget(target, event, "us-east-1");
+
+        verify(kinesisService).putRecord(eq("hub"),
+                aryEq("{\"id\":\"evt-1\",\"type\":\"AuthorRegistered\"}".getBytes(StandardCharsets.UTF_8)),
+                eq("evt-1"), eq("us-east-1"));
+    }
+
+    @Test
+    void invokeTarget_kinesisTarget_missingPartitionKeyPathDoesNotPut() {
+        Target target = new Target("stream",
+                "arn:aws:kinesis:us-east-1:000000000000:stream/hub", null, "$.detail");
+
+        invoker.invokeTarget(target, "{\"detail\":{\"id\":\"evt-1\"}}", "us-east-1");
+
+        verifyNoInteractions(kinesisService);
     }
 
     @Test

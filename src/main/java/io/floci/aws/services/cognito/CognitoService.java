@@ -5783,12 +5783,14 @@ public class CognitoService implements ResourceProvider, StoredResourceArns {
         }
     }
 
-    String getSigningKeyId(UserPool pool) {
+    /** The pool's current RS256 key id, generating a key pair on first use. */
+    public String getSigningKeyId(UserPool pool) {
         ensureJwtSigningKeys(pool);
         return pool.getSigningKeyId();
     }
 
-    RSAPublicKey getSigningPublicKey(UserPool pool) {
+    /** The pool's current RS256 public key, generating a key pair on first use. */
+    public RSAPublicKey getSigningPublicKey(UserPool pool) {
         ensureJwtSigningKeys(pool);
 
         try {
